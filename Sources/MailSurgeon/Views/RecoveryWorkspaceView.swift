@@ -5,6 +5,7 @@ struct RecoveryWorkspaceView: View {
   @State private var issueQuery = ""
   @State private var selectedIssueID: String?
   @State private var showsInspector = true
+  @State private var commandQueue = UICommandQueue<RecoveryUICommand>()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -19,11 +20,24 @@ struct RecoveryWorkspaceView: View {
       issueQuery = model.recoveryIssueSearchText
       selectedIssueID = model.selectedRecoveryIssueID
     }
-    .onChange(of: issueQuery) { _, value in
-      model.recoveryIssueSearchText = value
+    .task(id: issueQuery) {
+      try? await Task.sleep(for: .milliseconds(250))
+      guard !Task.isCancelled else { return }
+      model.applyRecoveryIssueSearchText(issueQuery)
     }
     .task(id: selectedIssueID) {
       model.selectRecoveryIssue(id: selectedIssueID)
+    }
+    .task(id: commandQueue.pendingCommand) {
+      guard let pending = commandQueue.pendingCommand else { return }
+      execute(pending.command)
+      commandQueue.complete(pending)
+    }
+    .task(id: model.displayedRecoveryIssues.map(\.id)) {
+      let displayedIDs = Set(model.displayedRecoveryIssues.map(\.id))
+      guard let selectedIssueID, !displayedIDs.contains(selectedIssueID) else { return }
+      self.selectedIssueID = nil
+      model.selectRecoveryIssue(id: nil)
     }
     .inspector(isPresented: $showsInspector) {
       RecoveryInspectorView()
@@ -145,7 +159,8 @@ struct RecoveryWorkspaceView: View {
   private var severityMenu: some View {
     Menu {
       Button("Vymazat filtry") {
-        model.resetRecoveryFilters()
+        UIActionLogger.debug("recovery filter command queued: reset")
+        commandQueue.queue(.resetFilters)
       }
       .disabled(model.enabledRecoverySeverities.isEmpty && model.selectedRecoveryIssueKind == nil)
 
@@ -153,10 +168,9 @@ struct RecoveryWorkspaceView: View {
 
       ForEach(RecoverySeverity.allCases) { severity in
         Button {
-          model.setRecoverySeverity(
-            severity,
-            enabled: !model.enabledRecoverySeverities.contains(severity)
-          )
+          let enabled = !model.enabledRecoverySeverities.contains(severity)
+          UIActionLogger.debug("recovery filter command queued: severity-\(severity.id)")
+          commandQueue.queue(.setSeverity(severity, enabled))
         } label: {
           menuLabel(
             severity.czechLabel,
@@ -175,7 +189,8 @@ struct RecoveryWorkspaceView: View {
   private var issueKindMenu: some View {
     Menu {
       Button {
-        model.selectedRecoveryIssueKind = nil
+        UIActionLogger.debug("recovery filter command queued: issue-kind-all")
+        commandQueue.queue(.setIssueKind(nil))
       } label: {
         menuLabel("Všechny typy", checked: model.selectedRecoveryIssueKind == nil)
       }
@@ -185,7 +200,8 @@ struct RecoveryWorkspaceView: View {
       ForEach(RecoveryIssueKind.allCases) { kind in
         if model.recoveryReport?.countsByKind[kind, default: 0] ?? 0 > 0 {
           Button {
-            model.selectedRecoveryIssueKind = kind
+            UIActionLogger.debug("recovery filter command queued: issue-kind-\(kind.id)")
+            commandQueue.queue(.setIssueKind(kind))
           } label: {
             menuLabel(kind.label, checked: model.selectedRecoveryIssueKind == kind)
           }
@@ -199,5 +215,19 @@ struct RecoveryWorkspaceView: View {
 
   private func menuLabel(_ title: String, checked: Bool) -> some View {
     Label(title, systemImage: checked ? "checkmark" : " ")
+  }
+
+  private func execute(_ command: RecoveryUICommand) {
+    switch command {
+    case .setSeverity(let severity, let enabled):
+      model.applyRecoverySeverity(severity, enabled: enabled)
+      UIActionLogger.debug("recovery filter command completed: severity-\(severity.id)")
+    case .setIssueKind(let kind):
+      model.applyRecoveryIssueKind(kind)
+      UIActionLogger.debug("recovery filter command completed: issue-kind")
+    case .resetFilters:
+      model.resetRecoveryFilters()
+      UIActionLogger.debug("recovery filter command completed: reset")
+    }
   }
 }

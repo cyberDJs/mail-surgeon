@@ -13,19 +13,31 @@ Do not use `swift run MailSurgeon` for GUI acceptance testing.
 
 ## Source hash verification
 
-Before an export:
+Before interactive mailbox QA, record the source mailbox SHA-256:
 
 ```bash
 shasum -a 256 /path/to/source.mbox
 ```
 
-After every report or MBOX export:
+After all search, recovery, export, attachment-save, and source-selection tests, run the same command again:
 
 ```bash
 shasum -a 256 /path/to/source.mbox
 ```
 
-The source hash must be identical before and after the operation.
+The source hash must be identical before and after the full sequence. Do not paste private mailbox paths into commits, tests, screenshots, or issue comments unless the owner explicitly approves it.
+
+## Unified logging
+
+Run unified logging in a separate terminal while performing manual QA:
+
+```bash
+log stream --style compact --predicate 'process == "MailSurgeon"'
+```
+
+Debug builds emit privacy-safe `UIActions` events for queued/completed menu commands, source open panels, save panels, and useful List selection boundaries. These events use generic command names only. They must not include sender names, email addresses, subjects, message bodies, attachment names, filesystem paths, recovery evidence, raw headers, or sensitive metadata.
+
+If an AppKit warning appears, record the exact immediately preceding `UIActions` log entry and the visible interaction that triggered it.
 
 ## Checklist
 
@@ -41,46 +53,75 @@ The source hash must be identical before and after the operation.
 
 6. Select an MBOX source.
 7. Load messages.
-8. Click search.
-9. Type text continuously.
-10. Search retains keyboard focus.
-11. Results update after debounce.
-12. Clearing search restores results.
-13. Filter menu changes results.
-14. Sort menu changes order.
-15. Selecting a message opens the inspector.
-16. Changing message selection does not reset search focus.
-17. Paging works when indexed results exceed one page.
+8. Open and close the message filter menu without selecting anything.
+9. Enable one message filter.
+10. Clear message filters.
+11. Select at least three different message sort modes.
+12. Click search.
+13. Type text continuously.
+14. Search retains keyboard focus.
+15. Results update after debounce.
+16. Clearing search restores results.
+17. Selecting several messages opens the inspector and does not reset search focus.
+18. Show and hide the message inspector.
+19. Paging works when indexed results exceed one page.
 
 ### Recovery
 
-18. Start Recovery Dry Run.
-19. Progress updates.
-20. Cancel works safely.
-21. Completed report shows issue summary.
-22. Recovery search works.
-23. Severity/type filtering works.
-24. Selecting an issue opens the inspector.
+20. Start Recovery Dry Run.
+21. Progress updates.
+22. Cancel works safely.
+23. Let one scan complete if practical.
+24. Completed report shows issue summary.
+25. Recovery search works with continuous typing.
+26. Severity filtering changes the issue list.
+27. Clearing recovery filters works.
+28. Issue-type filtering changes the issue list.
+29. Selecting several issues opens the inspector without destabilizing the list.
 
 ### Export
 
-25. JSON export opens a save panel and creates a file.
-26. Markdown export opens a save panel and creates a file.
-27. Preserve All MBOX export creates a file.
-28. Deduplicated MBOX export creates a file.
-29. Recoverable Only MBOX export creates a file.
-30. Cancelling any save panel is harmless.
-31. Export errors are visible.
-32. Source MBOX SHA-256 is unchanged.
+30. Switch to Export.
+31. Open and cancel JSON save panel.
+32. Open and complete JSON save panel.
+33. Open and cancel Markdown save panel.
+34. Open and complete Markdown save panel.
+35. Open and cancel Preserve All recovered MBOX export.
+36. Open and complete Preserve All recovered MBOX export.
+37. Open and cancel Deduplicated recovered MBOX export.
+38. Open and complete Deduplicated recovered MBOX export.
+39. Open and cancel Recoverable Only recovered MBOX export.
+40. Open and complete Recoverable Only recovered MBOX export.
+41. Open and cancel attachment save if an attachment is available.
+42. Cancelling any save panel is non-error behavior: it may update status, but must not show an error.
+43. Export errors are visible.
+44. Repeated clicks while a save panel is open must not open duplicate panels.
+45. Source MBOX SHA-256 is unchanged.
 
-### Runtime warning
+### Source addition
 
-Run the application from Terminal through `make run` and inspect logs during:
+46. Open Add Source menu.
+47. Select MBOX and cancel the open panel.
+48. Cancellation is non-error behavior and creates no source.
+49. Select MBOX again and complete the open panel.
+50. Exactly one new source is created.
+51. Source selection updates only after the open panel completes.
+52. Switch between Messages, Recovery, and Export several times.
+53. Quit the application.
 
+## Runtime warnings
+
+Run the application through `make run` and inspect unified logs during:
+
+- popup-menu open/close
+- message filter changes
+- message sort changes
+- source addition
 - search typing
 - list selection
-- sort changes
+- recovery severity/type filtering
 - recovery issue selection
+- save/open panel cancellation and completion
 
 This warning must not appear:
 
@@ -88,7 +129,14 @@ This warning must not appear:
 Application performed a reentrant operation in its NSTableView delegate.
 ```
 
-If it appears, record the exact interaction that triggered it and inspect List selection orchestration for synchronous model mutations.
+These warnings must also not appear:
+
+```text
+deferral block timed out
+deferral block executed twice
+```
+
+If any warning appears, do not suppress it. Record the exact preceding `UIActions` log entry, the interaction that triggered it, and whether the warning followed a popup-menu command, List selection, open panel, or save panel.
 
 ## Known limitations
 

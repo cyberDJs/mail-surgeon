@@ -5,6 +5,7 @@ struct MessagesWorkspaceView: View {
   @State private var query = ""
   @State private var selectedMessageID: String?
   @State private var showsInspector = true
+  @State private var commandQueue = UICommandQueue<MessagesUICommand>()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -25,6 +26,17 @@ struct MessagesWorkspaceView: View {
     }
     .task(id: selectedMessageID) {
       await model.selectMessage(id: selectedMessageID)
+    }
+    .task(id: commandQueue.pendingCommand) {
+      guard let pending = commandQueue.pendingCommand else { return }
+      await execute(pending.command)
+      commandQueue.complete(pending)
+    }
+    .task(id: model.displayedMessages.map(\.id)) {
+      let displayedIDs = Set(model.displayedMessages.map(\.id))
+      guard let selectedMessageID, !displayedIDs.contains(selectedMessageID) else { return }
+      self.selectedMessageID = nil
+      await model.selectMessage(id: nil)
     }
     .inspector(isPresented: $showsInspector) {
       MessageInspectorView()
@@ -106,7 +118,8 @@ struct MessagesWorkspaceView: View {
   private var filterMenu: some View {
     Menu {
       Button("Vymazat filtry") {
-        Task { await model.resetMessageFilters() }
+        UIActionLogger.debug("message filter command queued: reset")
+        commandQueue.queue(.resetFilters)
       }
       .disabled(model.enabledMessageFilters.isEmpty)
 
@@ -114,12 +127,9 @@ struct MessagesWorkspaceView: View {
 
       ForEach(MessageFilter.allCases) { filter in
         Button {
-          Task {
-            await model.applyFilter(
-              filter,
-              enabled: !model.enabledMessageFilters.contains(filter)
-            )
-          }
+          let enabled = !model.enabledMessageFilters.contains(filter)
+          UIActionLogger.debug("message filter command queued: \(filter.id)")
+          commandQueue.queue(.setFilter(filter, enabled))
         } label: {
           Label(
             filter.rawValue,
@@ -140,7 +150,8 @@ struct MessagesWorkspaceView: View {
     Menu {
       ForEach(MessageSortDescriptor.menuChoices, id: \.czechLabel) { descriptor in
         Button {
-          Task { await model.applyMessageSortDescriptor(descriptor) }
+          UIActionLogger.debug("message sort command queued: \(descriptor.logIdentifier)")
+          commandQueue.queue(.setSort(descriptor))
         } label: {
           Label(
             descriptor.czechLabel,
@@ -193,5 +204,19 @@ struct MessagesWorkspaceView: View {
     let start = min(model.messagePageOffset + 1, model.indexedResultTotal)
     let end = min(model.messagePageOffset + model.messagePageLimit, model.indexedResultTotal)
     return "\(start)-\(end) / \(model.indexedResultTotal)"
+  }
+
+  private func execute(_ command: MessagesUICommand) async {
+    switch command {
+    case .setSort(let descriptor):
+      await model.applyMessageSortDescriptor(descriptor)
+      UIActionLogger.debug("message sort command completed: \(descriptor.logIdentifier)")
+    case .setFilter(let filter, let enabled):
+      await model.applyFilter(filter, enabled: enabled)
+      UIActionLogger.debug("message filter command completed: \(filter.id)")
+    case .resetFilters:
+      await model.resetMessageFilters()
+      UIActionLogger.debug("message filter command completed: reset")
+    }
   }
 }

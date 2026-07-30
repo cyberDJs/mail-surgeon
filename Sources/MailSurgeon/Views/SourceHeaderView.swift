@@ -3,6 +3,7 @@ import SwiftUI
 struct SourceHeaderView: View {
   @EnvironmentObject private var model: AppModel
   @State private var confirmsIndexDeletion = false
+  @State private var commandQueue = UICommandQueue<IndexUICommand>()
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
@@ -35,6 +36,11 @@ struct SourceHeaderView: View {
       }
     }
     .padding(12)
+    .task(id: commandQueue.pendingCommand) {
+      guard let pending = commandQueue.pendingCommand else { return }
+      await execute(pending.command)
+      commandQueue.complete(pending)
+    }
     .confirmationDialog(
       "Smazat lokální index?",
       isPresented: $confirmsIndexDeletion,
@@ -74,14 +80,14 @@ struct SourceHeaderView: View {
   private var indexMenu: some View {
     Menu {
       Button {
-        Task { await model.buildIndexForSelectedSource() }
+        commandQueue.queue(.build)
       } label: {
         Label("Vytvořit index", systemImage: "bolt.badge.magnifyingglass")
       }
       .disabled(model.isIndexing || model.selectedSourceID == nil)
 
       Button {
-        Task { await model.buildIndexForSelectedSource(rebuild: true) }
+        commandQueue.queue(.rebuild)
       } label: {
         Label("Přestavět index", systemImage: "arrow.clockwise")
       }
@@ -99,5 +105,14 @@ struct SourceHeaderView: View {
       Label("Index", systemImage: "externaldrive")
     }
     .help("Správa lokálního SQLite indexu")
+  }
+
+  private func execute(_ command: IndexUICommand) async {
+    switch command {
+    case .build:
+      await model.buildIndexForSelectedSource()
+    case .rebuild:
+      await model.buildIndexForSelectedSource(rebuild: true)
+    }
   }
 }

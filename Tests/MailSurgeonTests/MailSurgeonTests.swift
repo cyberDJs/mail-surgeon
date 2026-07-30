@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 
 @testable import MailSurgeon
@@ -364,6 +365,102 @@ final class MailSurgeonTests: XCTestCase {
     await model.resetMessageFilters()
 
     XCTAssertTrue(model.enabledMessageFilters.isEmpty)
+  }
+
+  func testQueuedUICommandExecutesExactlyOnce() {
+    var queue = UICommandQueue<MessagesUICommand>()
+    queue.queue(.resetFilters)
+    var executions = 0
+
+    if let pending = queue.pendingCommand {
+      executions += 1
+      queue.complete(pending)
+    }
+    if let pending = queue.pendingCommand {
+      executions += 1
+      queue.complete(pending)
+    }
+
+    XCTAssertEqual(executions, 1)
+    XCTAssertNil(queue.pendingCommand)
+  }
+
+  func testReplacingPendingUICommandIsDeterministic() {
+    var queue = UICommandQueue<MessagesUICommand>()
+    let first = queue.queue(.resetFilters)
+    let second = queue.queue(.setSort(.init(column: .sender, ascending: true)))
+
+    queue.complete(first)
+    XCTAssertEqual(queue.pendingCommand, second)
+
+    queue.complete(second)
+    XCTAssertNil(queue.pendingCommand)
+  }
+
+  func testCompletedUICommandDoesNotExecuteAgainAfterRefresh() {
+    var queue = UICommandQueue<MessagesUICommand>()
+    let pending = queue.queue(.resetFilters)
+    queue.complete(pending)
+
+    var executions = 0
+    if let pending = queue.pendingCommand {
+      executions += 1
+      queue.complete(pending)
+    }
+
+    XCTAssertEqual(executions, 0)
+  }
+
+  func testRecoveryFilterCommandExecutesExactlyOnce() {
+    var queue = UICommandQueue<RecoveryUICommand>()
+    queue.queue(.setSeverity(.critical, true))
+    var executions = 0
+
+    if let pending = queue.pendingCommand {
+      executions += 1
+      queue.complete(pending)
+    }
+    if queue.pendingCommand != nil {
+      executions += 1
+    }
+
+    XCTAssertEqual(executions, 1)
+  }
+
+  @MainActor
+  func testFilterUpdateResetsIndexedPaging() async {
+    let source = MailSourceDescriptor(
+      name: "indexed.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/indexed.mbox")
+    )
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.indexProgress = MailIndexProgress(
+      status: .indexed,
+      indexedMessages: 400,
+      bytesIndexed: 0,
+      databaseSize: 0,
+      detail: "Indexováno"
+    )
+    model.messagePageOffset = 200
+
+    await model.applyFilter(.duplicates, enabled: true)
+
+    XCTAssertEqual(model.messagePageOffset, 0)
+    XCTAssertTrue(model.enabledMessageFilters.contains(.duplicates))
+  }
+
+  @MainActor
+  func testMessageSelectionDoesNotResetSearchText() async {
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.messages = [record(subject: "Invoice", sender: "sender@example.test")]
+    model.messageSearchText = "invoice"
+
+    await model.selectMessage(id: model.messages.first?.id)
+
+    XCTAssertEqual(model.messageSearchText, "invoice")
   }
 
   func testMBOXConnectorStoresMessageOffsetsAndLengths() async throws {
@@ -1527,7 +1624,7 @@ final class MailSurgeonTests: XCTestCase {
   }
 
   @MainActor
-  func testExportCommandStateValidationAndCancelledSavePanel() {
+  func testExportCommandStateValidationAndCancelledSavePanel() async {
     let panel = FakeSavePanelProvider()
     let model = AppModel(savePanelProvider: panel)
     model.sources = []
@@ -1548,11 +1645,284 @@ final class MailSurgeonTests: XCTestCase {
     XCTAssertTrue(model.canExportRecoveryReport)
     XCTAssertTrue(model.canExportRecoveryMBOX)
 
-    model.exportRecoveryReportJSON()
+    await model.exportRecoveryReportJSON()
 
     XCTAssertEqual(panel.commands, [.recoveryReportJSON])
     XCTAssertNil(model.recoveryErrorMessage)
     XCTAssertFalse(model.statusMessage.contains("selhal"))
+  }
+
+  @MainActor
+  func testOpenPanelCancellationCreatesNoSourceAndIsNonError() async {
+    let panel = FakeOpenPanelProvider()
+    panel.responses = [nil]
+    let model = AppModel(
+      savePanelProvider: FakeSavePanelProvider(),
+      openPanelProvider: panel,
+      bookmarkStore: makeIsolatedBookmarkStore()
+    )
+
+    let createdID = await model.addSource(.mbox)
+
+    XCTAssertNil(createdID)
+    XCTAssertTrue(model.sources.isEmpty)
+    XCTAssertTrue(model.statusMessage.contains("zrušen"))
+  }
+
+  @MainActor
+  func testOpenPanelSuccessCreatesOneSourceAndReturnsID() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("success.mbox")
+    try writeMBOX(
+      messages: [
+        message(id: "success@example.test", subject: "Success", extraHeaders: [], body: "Body\n")
+      ],
+      to: fileURL
+    )
+    let panel = FakeOpenPanelProvider()
+    panel.responses = [fileURL]
+    let model = AppModel(
+      savePanelProvider: FakeSavePanelProvider(),
+      openPanelProvider: panel,
+      bookmarkStore: makeIsolatedBookmarkStore()
+    )
+
+    let createdID = await model.addSource(.mbox)
+
+    XCTAssertEqual(model.sources.count, 1)
+    XCTAssertEqual(createdID, model.sources.first?.id)
+    XCTAssertEqual(model.selectedSourceID, createdID)
+  }
+
+  @MainActor
+  func testSourceSelectionOccursOnlyAfterOpenPanelCompletion() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("delayed.mbox")
+    try writeMBOX(
+      messages: [
+        message(id: "delayed@example.test", subject: "Delayed", extraHeaders: [], body: "Body\n")
+      ],
+      to: fileURL
+    )
+    let panel = FakeOpenPanelProvider()
+    panel.waitForManualResponse = true
+    let model = AppModel(
+      savePanelProvider: FakeSavePanelProvider(),
+      openPanelProvider: panel,
+      bookmarkStore: makeIsolatedBookmarkStore()
+    )
+
+    let task = Task { await model.addSource(.mbox) }
+    let didRequestPanel = await waitUntil { panel.requestCount == 1 }
+    XCTAssertTrue(didRequestPanel)
+    XCTAssertTrue(model.sources.isEmpty)
+    XCTAssertNil(model.selectedSourceID)
+
+    XCTAssertTrue(panel.completeNext(with: fileURL))
+    let createdID = await task.value
+
+    XCTAssertEqual(model.sources.count, 1)
+    XCTAssertEqual(model.selectedSourceID, createdID)
+  }
+
+  @MainActor
+  func testSavePanelCancellationIsNonErrorBehavior() async {
+    let panel = FakeSavePanelProvider()
+    panel.responses = [nil]
+    let source = MailSourceDescriptor(
+      name: "cancel.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/cancel.mbox")
+    )
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    await model.exportRecoveryReportJSON()
+
+    XCTAssertNil(model.recoveryErrorMessage)
+    XCTAssertTrue(model.statusMessage.contains("zrušen"))
+  }
+
+  @MainActor
+  func testSavePanelSuccessReturnsExpectedDestination() async throws {
+    let directory = try makeTemporaryDirectory()
+    let destination = directory.appendingPathComponent("selected.json")
+    let panel = FakeSavePanelProvider()
+    panel.destinations[.recoveryReportJSON] = destination
+
+    let selected = await panel.destination(for: .recoveryReportJSON)
+
+    XCTAssertEqual(selected, destination)
+    XCTAssertEqual(panel.commands, [.recoveryReportJSON])
+  }
+
+  @MainActor
+  func testAsyncPanelContinuationCompletesExactlyOnce() async {
+    let panel = FakeSavePanelProvider()
+    panel.waitForManualResponse = true
+    let task = Task { await panel.destination(for: .recoveryReportJSON) }
+    let didPresentPanel = await waitUntil { panel.pendingContinuationCount == 1 }
+    XCTAssertTrue(didPresentPanel)
+
+    XCTAssertTrue(panel.completeNext(with: nil))
+    XCTAssertFalse(panel.completeNext(with: URL(fileURLWithPath: "/tmp/late.json")))
+    let selected = await task.value
+
+    XCTAssertNil(selected)
+    XCTAssertEqual(panel.completionCount, 1)
+  }
+
+  @MainActor
+  func testJSONExportDoesNotWriteBeforeDestinationSelection() async throws {
+    let directory = try makeSafeOutputDirectory()
+    let destination = directory.appendingPathComponent("report.json")
+    let panel = FakeSavePanelProvider()
+    panel.waitForManualResponse = true
+    let source = MailSourceDescriptor(name: "json.mbox", kind: .mbox, location: nil)
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    let task = Task { await model.exportRecoveryReportJSON() }
+    let didPresentPanel = await waitUntil { panel.commands == [.recoveryReportJSON] }
+    XCTAssertTrue(didPresentPanel)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+
+    XCTAssertTrue(panel.completeNext(with: destination))
+    await task.value
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+  }
+
+  @MainActor
+  func testMarkdownExportDoesNotWriteBeforeDestinationSelection() async throws {
+    let directory = try makeSafeOutputDirectory()
+    let destination = directory.appendingPathComponent("report.md")
+    let panel = FakeSavePanelProvider()
+    panel.waitForManualResponse = true
+    let source = MailSourceDescriptor(name: "markdown.mbox", kind: .mbox, location: nil)
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    let task = Task { await model.exportRecoveryReportMarkdown() }
+    let didPresentPanel = await waitUntil { panel.commands == [.recoveryReportMarkdown] }
+    XCTAssertTrue(didPresentPanel)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+
+    XCTAssertTrue(panel.completeNext(with: destination))
+    await task.value
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+  }
+
+  @MainActor
+  func testMBOXExportDoesNotStartBeforeDestinationSelection() async throws {
+    let directory = try makeTemporaryDirectory()
+    let safeDirectory = try makeSafeOutputDirectory()
+    let sourceURL = directory.appendingPathComponent("source.mbox")
+    try writeMBOX(
+      messages: [
+        message(id: "mbox@example.test", subject: "MBOX", extraHeaders: [], body: "Body\n")
+      ],
+      to: sourceURL
+    )
+    let destination = safeDirectory.appendingPathComponent("output.mbox")
+    let panel = FakeSavePanelProvider()
+    panel.waitForManualResponse = true
+    let source = MailSourceDescriptor(name: "source.mbox", kind: .mbox, location: sourceURL)
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    let task = Task { await model.exportRecoveryMBOX(mode: .preserveAll) }
+    let didPresentPanel = await waitUntil { panel.commands.count == 1 }
+    XCTAssertTrue(didPresentPanel)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+
+    XCTAssertTrue(panel.completeNext(with: destination))
+    await task.value
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+  }
+
+  @MainActor
+  func testRepeatedExportRequestsDoNotOpenDuplicatePanels() async {
+    let panel = FakeSavePanelProvider()
+    panel.waitForManualResponse = true
+    let source = MailSourceDescriptor(name: "duplicate.mbox", kind: .mbox, location: nil)
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    let first = Task { await model.exportRecoveryReportJSON() }
+    let didPresentPanel = await waitUntil { panel.pendingContinuationCount == 1 }
+    XCTAssertTrue(didPresentPanel)
+    let second = Task { await model.exportRecoveryReportJSON() }
+    await second.value
+
+    XCTAssertEqual(panel.commands, [.recoveryReportJSON])
+    XCTAssertTrue(panel.completeNext(with: nil))
+    await first.value
+  }
+
+  @MainActor
+  func testRecoveryFilterCommandsClearStaleSelection() {
+    let source = MailSourceDescriptor(name: "recovery.mbox", kind: .mbox, location: nil)
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    let critical = recoveryIssue(
+      id: "critical",
+      sourceID: source.id,
+      severity: .critical,
+      kind: .missingMessageID
+    )
+    let info = recoveryIssue(
+      id: "info",
+      sourceID: source.id,
+      severity: .info,
+      kind: .missingDateHeader
+    )
+    model.recoveryReport = recoveryReport(source: source, issues: [critical, info])
+    model.selectedRecoveryIssueID = info.id
+
+    model.applyRecoverySeverity(.critical, enabled: true)
+
+    XCTAssertEqual(model.displayedRecoveryIssues.map(\.id), [critical.id])
+    XCTAssertNil(model.selectedRecoveryIssueID)
+  }
+
+  @MainActor
+  func testSourceMBOXRemainsByteIdenticalAfterExport() async throws {
+    let directory = try makeTemporaryDirectory()
+    let safeDirectory = try makeSafeOutputDirectory()
+    let sourceURL = directory.appendingPathComponent("integrity.mbox")
+    try writeMBOX(
+      messages: [
+        message(
+          id: "integrity@example.test", subject: "Integrity", extraHeaders: [], body: "Body\n")
+      ],
+      to: sourceURL
+    )
+    let before = try sha256Hex(sourceURL)
+    let destination = safeDirectory.appendingPathComponent("integrity-output.mbox")
+    let panel = FakeSavePanelProvider()
+    panel.destinations[.recoveryMBOX(defaultName: "integrity.mbox-recovered.mbox")] = destination
+    let source = MailSourceDescriptor(name: "integrity.mbox", kind: .mbox, location: sourceURL)
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    await model.exportRecoveryMBOX(mode: .preserveAll)
+    let after = try sha256Hex(sourceURL)
+
+    XCTAssertEqual(before, after)
   }
 
   private func makeTemporaryDirectory() throws -> URL {
@@ -1584,6 +1954,13 @@ final class MailSurgeonTests: XCTestCase {
       .appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+  }
+
+  private func makeIsolatedBookmarkStore() -> SecurityScopedBookmarkStore {
+    let suiteName = "MailSurgeonTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    return SecurityScopedBookmarkStore(defaults: defaults)
   }
 
   private func message(
@@ -1671,7 +2048,33 @@ final class MailSurgeonTests: XCTestCase {
     ).date!
   }
 
-  private func recoveryReport(source: MailSourceDescriptor) -> RecoveryReport {
+  private func recoveryIssue(
+    id: String,
+    sourceID: UUID,
+    severity: RecoverySeverity,
+    kind: RecoveryIssueKind
+  ) -> RecoveryIssue {
+    RecoveryIssue(
+      id: id,
+      sourceID: sourceID,
+      messageSummaryID: nil,
+      kind: kind,
+      severity: severity,
+      confidence: .high,
+      title: kind.label,
+      technicalExplanation: "Synthetic test issue.",
+      byteOffset: nil,
+      byteLength: nil,
+      isSafelyRepairable: true,
+      suggestedAction: .inspectManually,
+      evidence: [:]
+    )
+  }
+
+  private func recoveryReport(
+    source: MailSourceDescriptor,
+    issues: [RecoveryIssue] = []
+  ) -> RecoveryReport {
     RecoveryReport(
       id: UUID(),
       sourceID: source.id,
@@ -1686,7 +2089,7 @@ final class MailSurgeonTests: XCTestCase {
       completedAt: Date(timeIntervalSince1970: 1),
       totalMessagesScanned: 0,
       totalBytesScanned: 0,
-      issues: [],
+      issues: issues,
       suggestions: [],
       estimatedOutputMessageCount: 0,
       estimatedRemovedDuplicateCount: 0,
@@ -1696,14 +2099,85 @@ final class MailSurgeonTests: XCTestCase {
     )
   }
 
+  private func sha256Hex(_ url: URL) throws -> String {
+    let digest = SHA256.hash(data: try Data(contentsOf: url))
+    return digest.map { String(format: "%02x", $0) }.joined()
+  }
+
+  @MainActor
+  private func waitUntil(
+    timeout: Duration = .seconds(1),
+    predicate: () -> Bool
+  ) async -> Bool {
+    let start = ContinuousClock.now
+    while start.duration(to: .now) < timeout {
+      if predicate() { return true }
+      try? await Task.sleep(for: .milliseconds(10))
+    }
+    return predicate()
+  }
+
+  @MainActor
+  private final class FakeOpenPanelProvider: OpenPanelProviding {
+    var requestCount = 0
+    var responses: [URL?] = []
+    var waitForManualResponse = false
+    private var continuations: [CheckedContinuation<URL?, Never>] = []
+
+    var pendingContinuationCount: Int {
+      continuations.count
+    }
+
+    func selectMBOX() async -> URL? {
+      requestCount += 1
+      if waitForManualResponse {
+        return await withCheckedContinuation { continuation in
+          continuations.append(continuation)
+        }
+      }
+      return responses.isEmpty ? nil : responses.removeFirst()
+    }
+
+    @discardableResult
+    func completeNext(with url: URL?) -> Bool {
+      guard !continuations.isEmpty else { return false }
+      continuations.removeFirst().resume(returning: url)
+      return true
+    }
+  }
+
   @MainActor
   private final class FakeSavePanelProvider: SavePanelProviding {
     var commands: [SavePanelCommand] = []
     var destinations: [SavePanelCommand: URL] = [:]
+    var responses: [URL?] = []
+    var waitForManualResponse = false
+    var completionCount = 0
+    private var continuations: [CheckedContinuation<URL?, Never>] = []
 
-    func destination(for command: SavePanelCommand) -> URL? {
+    var pendingContinuationCount: Int {
+      continuations.count
+    }
+
+    func destination(for command: SavePanelCommand) async -> URL? {
       commands.append(command)
+      if waitForManualResponse {
+        return await withCheckedContinuation { continuation in
+          continuations.append(continuation)
+        }
+      }
+      if !responses.isEmpty {
+        return responses.removeFirst()
+      }
       return destinations[command]
+    }
+
+    @discardableResult
+    func completeNext(with url: URL?) -> Bool {
+      guard !continuations.isEmpty else { return false }
+      completionCount += 1
+      continuations.removeFirst().resume(returning: url)
+      return true
     }
   }
 }

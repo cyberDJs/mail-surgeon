@@ -3,6 +3,7 @@ import SwiftUI
 struct SourceSidebarView: View {
   @EnvironmentObject private var model: AppModel
   @Binding var selectedSourceID: UUID?
+  @State private var commandQueue = UICommandQueue<SourceUICommand>()
 
   var body: some View {
     List(selection: $selectedSourceID) {
@@ -20,12 +21,17 @@ struct SourceSidebarView: View {
     }
     .navigationTitle("Mail Surgeon")
     .accessibilityLabel("Seznam zdrojů")
+    .task(id: commandQueue.pendingCommand) {
+      guard let pending = commandQueue.pendingCommand else { return }
+      await execute(pending.command)
+      commandQueue.complete(pending)
+    }
     .toolbar {
       Menu {
         ForEach(MailSourceKind.allCases) { kind in
           Button {
-            model.addSource(kind)
-            selectedSourceID = model.selectedSourceID
+            UIActionLogger.debug("source add command queued: \(kind.id)")
+            commandQueue.queue(.addSource(kind))
           } label: {
             Label(kind.rawValue, systemImage: kind.systemImage)
           }
@@ -34,6 +40,17 @@ struct SourceSidebarView: View {
         Label("Přidat zdroj", systemImage: "plus")
       }
       .help("Přidat zdroj mailboxu")
+    }
+  }
+
+  private func execute(_ command: SourceUICommand) async {
+    switch command {
+    case .addSource(let kind):
+      let sourceID = await model.addSource(kind)
+      if let sourceID {
+        selectedSourceID = sourceID
+      }
+      UIActionLogger.debug("source add command completed: \(kind.id)")
     }
   }
 }
