@@ -1,8 +1,8 @@
-import CryptoKit
 import Foundation
 
 struct MBOXConnector: MailSourceConnector {
     let descriptor: MailSourceDescriptor
+    private let parser = MailMessageParser()
 
     func validateAccess() async throws {
         guard let url = descriptor.location else {
@@ -132,12 +132,14 @@ struct MBOXConnector: MailSourceConnector {
 
         var pending = Data()
         var currentMessage = Data()
+        var currentMessageOffset: UInt64 = 0
+        var consumedOffset: UInt64 = 0
         var emittedMessages = 0
         var sawDelimiter = false
         var sawNonEmptyBeforeDelimiter = false
         let newline = Data([0x0A])
 
-        func consume(_ line: Data) throws {
+        func consume(_ line: Data, at lineOffset: UInt64) throws {
             try Task.checkCancellation()
 
             if isMBOXDelimiter(line) {
@@ -148,10 +150,11 @@ struct MBOXConnector: MailSourceConnector {
                         from: currentMessage,
                         fileURL: fileURL,
                         root: root,
-                        index: startingIndex + emittedMessages
+                        byteOffset: currentMessageOffset
                     ))
                     currentMessage.removeAll(keepingCapacity: true)
                 }
+                currentMessageOffset = lineOffset + UInt64(line.count)
                 return
             }
 
@@ -168,13 +171,16 @@ struct MBOXConnector: MailSourceConnector {
             pending.append(chunk)
             while let range = pending.firstRange(of: newline) {
                 let line = pending[..<range.upperBound]
-                try consume(Data(line))
+                let lineData = Data(line)
+                try consume(lineData, at: consumedOffset)
+                consumedOffset += UInt64(lineData.count)
                 pending.removeSubrange(..<range.upperBound)
             }
         }
 
         if !pending.isEmpty {
-            try consume(pending)
+            try consume(pending, at: consumedOffset)
+            consumedOffset += UInt64(pending.count)
         }
 
         if !currentMessage.isEmpty {
@@ -183,7 +189,7 @@ struct MBOXConnector: MailSourceConnector {
                 from: currentMessage,
                 fileURL: fileURL,
                 root: root,
-                index: startingIndex + emittedMessages
+                byteOffset: currentMessageOffset
             ))
         }
 
@@ -199,21 +205,13 @@ struct MBOXConnector: MailSourceConnector {
         return line.starts(with: prefix)
     }
 
-    private func record(from rawData: Data, fileURL: URL, root: URL, index: Int) -> MailMessageRecord {
-        let rawMessage = decodeMessage(rawData)
-        let headers = parseHeaders(from: rawMessage)
-        return MailMessageRecord(
-            sourceIdentifier: "\(fileURL.path)#\(index)",
-            folderPath: folderName(for: fileURL, root: root),
-            messageID: header("Message-ID", in: headers),
-            subject: decodeHeader(header("Subject", in: headers) ?? "(bez předmětu)"),
-            sender: decodeHeader(header("From", in: headers) ?? ""),
-            recipients: parseRecipients(header("To", in: headers)),
-            sentDate: parseDate(header("Date", in: headers)),
-            byteSize: Int64(rawData.count),
-            rawSHA256: SHA256.hash(data: rawData).map { String(format: "%02x", $0) }.joined(),
-            hasAttachments: hasAttachment(headers: headers, rawMessage: rawMessage),
-            headers: headers
+    private func record(from rawData: Data, fileURL: URL, root: URL, byteOffset: UInt64) -> MailMessageRecord {
+        parser.record(
+            from: rawData,
+            fileURL: fileURL,
+            root: root,
+            folder: folderName(for: fileURL, root: root),
+            byteOffset: byteOffset
         )
     }
 
@@ -227,75 +225,6 @@ struct MBOXConnector: MailSourceConnector {
         return fileURL.deletingPathExtension().lastPathComponent
     }
 
-    private func decodeMessage(_ data: Data) -> String {
-        String(data: data, encoding: .utf8)
-            ?? String(data: data, encoding: .isoLatin1)
-            ?? ""
-    }
-
-    private func parseHeaders(from rawMessage: String) -> [String: String] {
-        let normalized = rawMessage.replacingOccurrences(of: "\r\n", with: "\n")
-        guard let separator = normalized.range(of: "\n\n") else { return [:] }
-        let headerBlock = normalized[..<separator.lowerBound]
-
-        var headers: [String: String] = [:]
-        var currentName: String?
-
-        for line in headerBlock.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.first == " " || line.first == "\t" {
-                if let currentName {
-                    headers[currentName, default: ""] += " " + line.trimmingCharacters(in: .whitespaces)
-                }
-                continue
-            }
-
-            guard let colon = line.firstIndex(of: ":") else { continue }
-            let name = String(line[..<colon])
-            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            headers[name] = value
-            currentName = name
-        }
-        return headers
-    }
-
-    private func header(_ name: String, in headers: [String: String]) -> String? {
-        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
-    }
-
-    private func parseRecipients(_ value: String?) -> [String] {
-        guard let value else { return [] }
-        return value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-    }
-
-    private func parseDate(_ value: String?) -> Date? {
-        guard let value else { return nil }
-        let formats = [
-            "EEE, d MMM yyyy HH:mm:ss Z",
-            "EEE, dd MMM yyyy HH:mm:ss Z",
-            "d MMM yyyy HH:mm:ss Z",
-            "dd MMM yyyy HH:mm:ss Z"
-        ]
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        for format in formats {
-            formatter.dateFormat = format
-            if let date = formatter.date(from: value) { return date }
-        }
-        return nil
-    }
-
-    private func hasAttachment(headers: [String: String], rawMessage: String) -> Bool {
-        let disposition = header("Content-Disposition", in: headers) ?? ""
-        if disposition.localizedCaseInsensitiveContains("attachment") { return true }
-        return rawMessage.localizedCaseInsensitiveContains("Content-Disposition: attachment")
-            || rawMessage.localizedCaseInsensitiveContains("filename=")
-    }
-
-    private func decodeHeader(_ value: String) -> String {
-        // RFC 2047 decoding will be added in the next parser pass. Preserve the original value for now.
-        value
-    }
 }
 
 private extension Data {
