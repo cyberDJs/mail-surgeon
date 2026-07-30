@@ -14,7 +14,7 @@ struct MailSourceDescriptor: Identifiable, Hashable, Sendable {
     }
 }
 
-enum MailSourceKind: String, CaseIterable, Identifiable, Sendable {
+enum MailSourceKind: String, CaseIterable, Identifiable, Codable, Sendable {
     case imap = "IMAP"
     case appleMail = "Apple Mail"
     case mbox = "MBOX"
@@ -35,7 +35,7 @@ enum MailSourceKind: String, CaseIterable, Identifiable, Sendable {
 }
 
 struct MailMessageRecord: Identifiable, Hashable, Sendable {
-    let id: UUID
+    var id: String { sourceIdentifier }
     let sourceIdentifier: String
     let folderPath: String
     let messageID: String?
@@ -47,9 +47,22 @@ struct MailMessageRecord: Identifiable, Hashable, Sendable {
     let rawSHA256: String
     let hasAttachments: Bool
     let headers: [String: String]
+    let location: MessageStorageLocation?
+    var classificationFlags: MessageClassificationFlags
+
+    var sentDateSortKey: TimeInterval {
+        sentDate?.timeIntervalSince1970 ?? 0
+    }
+
+    var attachmentSortKey: Int {
+        hasAttachments ? 1 : 0
+    }
+
+    var categoryLabel: String {
+        classificationFlags.displayLabel
+    }
 
     init(
-        id: UUID = UUID(),
         sourceIdentifier: String,
         folderPath: String,
         messageID: String?,
@@ -60,9 +73,10 @@ struct MailMessageRecord: Identifiable, Hashable, Sendable {
         byteSize: Int64,
         rawSHA256: String,
         hasAttachments: Bool,
-        headers: [String: String]
+        headers: [String: String],
+        location: MessageStorageLocation? = nil,
+        classificationFlags: MessageClassificationFlags = []
     ) {
-        self.id = id
         self.sourceIdentifier = sourceIdentifier
         self.folderPath = folderPath
         self.messageID = messageID
@@ -74,7 +88,80 @@ struct MailMessageRecord: Identifiable, Hashable, Sendable {
         self.rawSHA256 = rawSHA256
         self.hasAttachments = hasAttachments
         self.headers = headers
+        self.location = location
+        self.classificationFlags = classificationFlags
     }
+}
+
+struct MessageStorageLocation: Hashable, Sendable {
+    let fileURL: URL
+    let byteOffset: UInt64
+    let byteLength: Int64
+}
+
+struct MessageClassificationFlags: OptionSet, Hashable, Sendable {
+    let rawValue: Int
+
+    static let duplicate = MessageClassificationFlags(rawValue: 1 << 0)
+    static let newsletter = MessageClassificationFlags(rawValue: 1 << 1)
+    static let oneTimeCode = MessageClassificationFlags(rawValue: 1 << 2)
+    static let sensitive = MessageClassificationFlags(rawValue: 1 << 3)
+    static let large = MessageClassificationFlags(rawValue: 1 << 4)
+
+    var displayLabel: String {
+        var labels: [String] = []
+        if contains(.duplicate) { labels.append("Duplicitní") }
+        if contains(.newsletter) { labels.append("Newsletter") }
+        if contains(.oneTimeCode) { labels.append("OTP") }
+        if contains(.sensitive) { labels.append("Citlivé") }
+        if contains(.large) { labels.append("Velké") }
+        return labels.isEmpty ? "Běžné" : labels.joined(separator: ", ")
+    }
+}
+
+struct MessageDetail: Equatable, Sendable {
+    let sourceIdentifier: String
+    let headers: [String: String]
+    let metadata: [String: String]
+    let plainTextPreview: String?
+    let rawByteSize: Int64
+    let rawSHA256: String
+}
+
+enum MessageFilter: String, CaseIterable, Identifiable, Sendable {
+    case duplicates = "Duplicity"
+    case newsletters = "Newslettery"
+    case oneTimeCodes = "OTP"
+    case sensitive = "Citlivé"
+    case large = "Velké"
+
+    var id: String { rawValue }
+
+    var flag: MessageClassificationFlags {
+        switch self {
+        case .duplicates: .duplicate
+        case .newsletters: .newsletter
+        case .oneTimeCodes: .oneTimeCode
+        case .sensitive: .sensitive
+        case .large: .large
+        }
+    }
+}
+
+enum MessageSortColumn: String, Sendable {
+    case date
+    case sender
+    case subject
+    case size
+    case attachment
+    case category
+}
+
+struct MessageSortDescriptor: Equatable, Sendable {
+    var column: MessageSortColumn
+    var ascending: Bool
+
+    static let newestFirst = MessageSortDescriptor(column: .date, ascending: false)
 }
 
 struct MailboxAnalysis: Equatable, Sendable {

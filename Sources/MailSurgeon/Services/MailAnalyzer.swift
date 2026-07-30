@@ -35,23 +35,19 @@ struct MailAnalyzer: Sendable {
             }
             hashes[message.rawSHA256] = existingHashCount + 1
 
-            if message.headers.keys.contains(where: { $0.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame })
-                || message.headers.keys.contains(where: { $0.caseInsensitiveCompare("List-ID") == .orderedSame })
-            {
+            if message.classificationFlags.contains(.newsletter) {
                 likelyNewsletters += 1
             }
 
-            let otpTerms = ["verification code", "one-time password", "otp", "ověřovací kód"]
-            if otpTerms.contains(where: { message.subject.localizedCaseInsensitiveContains($0) }) {
+            if message.classificationFlags.contains(.oneTimeCode) {
                 likelyOneTimeCodes += 1
             }
 
-            if message.byteSize >= 25 * 1_024 * 1_024 {
+            if message.classificationFlags.contains(.large) {
                 largeMessages += 1
             }
 
-            let sensitiveTerms = ["invoice", "faktura", "smlouva", "contract", "bank", "úřad"]
-            if sensitiveTerms.contains(where: { message.subject.localizedCaseInsensitiveContains($0) }) {
+            if message.classificationFlags.contains(.sensitive) {
                 sensitiveCandidates += 1
             }
 
