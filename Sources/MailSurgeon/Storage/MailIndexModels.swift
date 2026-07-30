@@ -34,7 +34,7 @@ struct MailIndexProgress: Equatable, Sendable {
   )
 }
 
-struct SourceFingerprint: Equatable, Sendable {
+struct SourceFingerprint: Codable, Equatable, Sendable {
   var fileSize: Int64
   var modificationDate: Date?
   var lightweightHash: String

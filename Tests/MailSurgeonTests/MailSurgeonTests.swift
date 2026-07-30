@@ -937,6 +937,416 @@ final class MailSurgeonTests: XCTestCase {
     )
   }
 
+  func testRecoveryScannerDetectsRequiredSyntheticIssues() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("recovery.mbox")
+    let duplicate = rawMessage(
+      [
+        "Message-ID: <dup@example.test>",
+        "Subject: Duplicate",
+        "From: Sender <sender@example.test>",
+        "To: Recipient <recipient@example.test>",
+        "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        "Content-Type: text/plain; charset=utf-8",
+      ],
+      body: "Same body\n"
+    )
+    let multipartUnterminated = rawMessage(
+      [
+        "Message-ID: <mime@example.test>",
+        "Subject: MIME",
+        "From: Sender <sender@example.test>",
+        "To: Recipient <recipient@example.test>",
+        "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        "Content-Type: multipart/mixed; boundary=\"mix\"",
+      ],
+      body: """
+        --mix
+        Content-Type: text/plain; charset=x-unknown
+        Content-Transfer-Encoding: quoted-printable
+
+        Broken=XX text
+        --mix
+        Content-Type: application/octet-stream; name="../evil.bin"
+        Content-Disposition: attachment; filename="../evil.bin"
+        Content-Transfer-Encoding: base64
+        Content-ID: <dup-cid@example.test>
+
+        SGVsbG8*bad
+        --mix
+        Content-Type: application/octet-stream
+        Content-Disposition: inline
+        Content-Transfer-Encoding: base64
+        Content-ID: <dup-cid@example.test>
+
+
+        """
+    )
+    let htmlCID = rawMessage(
+      [
+        "Message-ID: <html@example.test>",
+        "Subject: HTML",
+        "From: Sender <sender@example.test>",
+        "To: Recipient <recipient@example.test>",
+        "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        "Content-Type: text/plain; charset=utf-8",
+      ],
+      body: "<html><body><img src=\"cid:missing@example.test\"></body></html>\n"
+    )
+    let zeroAttachment = rawMessage(
+      [
+        "Message-ID: <zero@example.test>",
+        "Subject: Zero Attachment",
+        "From: Sender <sender@example.test>",
+        "To: Recipient <recipient@example.test>",
+        "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        "Content-Type: multipart/mixed; boundary=\"zero\"",
+      ],
+      body: """
+        --zero
+        Content-Type: text/plain
+
+        Body
+        --zero
+        Content-Type: application/octet-stream
+        Content-Disposition: attachment
+        Content-Transfer-Encoding: base64
+
+
+        --zero--
+
+        """
+    )
+    let messages = [
+      rawMessage(
+        [
+          "Subject: Missing ID",
+          "From: Sender <sender@example.test>",
+          "To: Recipient <recipient@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        ],
+        body: "No ID\n"
+      ),
+      rawMessage(
+        [
+          "Message-ID: malformed",
+          "Subject: Bad ID",
+          "From: Sender <sender@example.test>",
+          "To: Recipient <recipient@example.test>",
+          "Date: not a date",
+          "Content-Type: multipart/mixed",
+        ],
+        body: "From body line\n"
+      ),
+      rawMessage(
+        [
+          "Message-ID: <missing-from@example.test>",
+          "Subject: Missing From",
+          "To: Recipient <recipient@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        ],
+        body: "Body\n"
+      ),
+      rawMessage(
+        [
+          "Message-ID: <missing-to@example.test>",
+          "Subject: Missing To",
+          "From: Sender <sender@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        ],
+        body: "Body\n"
+      ),
+      "Message-ID: <unterminated@example.test>\nSubject: No terminator\nFrom: Sender <sender@example.test>\nTo: Recipient <recipient@example.test>\nDate: Thu, 1 Jan 2026 00:00:00 +0000\n",
+      " Bad folded\nMessage-ID: <folded@example.test>\nBad Header\nSubject: Folded\nFrom: Sender <sender@example.test>\nTo: Recipient <recipient@example.test>\nDate: Thu, 1 Jan 2026 00:00:00 +0000\n\nBody\n",
+      rawMessage(
+        [
+          "Message-ID: <binary@example.test>",
+          "Subject: Binary",
+          "From: Sender <sender@example.test>\u{0001}",
+          "To: Recipient <recipient@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        ],
+        body: "Body\n"
+      ),
+      rawMessage(
+        [
+          "Message-ID: <unknown-encoding@example.test>",
+          "Subject: Encoding",
+          "From: Sender <sender@example.test>",
+          "To: Recipient <recipient@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+          "Content-Type: text/plain; charset=x-unknown",
+          "Content-Transfer-Encoding: x-custom",
+        ],
+        body: "Body\n"
+      ),
+      duplicate,
+      duplicate,
+      rawMessage(
+        [
+          "Message-ID: <dup@example.test>",
+          "Subject: Duplicate Different",
+          "From: Sender <sender@example.test>",
+          "To: Recipient <recipient@example.test>",
+          "Date: Thu, 1 Jan 2026 00:00:00 +0000",
+        ],
+        body: "Different body\n"
+      ),
+      multipartUnterminated,
+      htmlCID,
+      zeroAttachment,
+    ]
+    try writeMBOX(messages: messages, to: fileURL)
+
+    let report = try await RecoveryScanner().scan(
+      source: MailSourceDescriptor(name: "recovery.mbox", kind: .mbox, location: fileURL)
+    )
+    let kinds = Set(report.issues.map(\.kind))
+
+    XCTAssertTrue(kinds.contains(.missingMessageID))
+    XCTAssertTrue(kinds.contains(.malformedMessageID))
+    XCTAssertTrue(kinds.contains(.duplicateMessageID))
+    XCTAssertTrue(kinds.contains(.sameMessageIDDifferentHash))
+    XCTAssertTrue(kinds.contains(.invalidDateHeader))
+    XCTAssertTrue(kinds.contains(.missingFromHeader))
+    XCTAssertTrue(kinds.contains(.missingRecipientHeaders))
+    XCTAssertTrue(kinds.contains(.missingHeaderTerminator))
+    XCTAssertTrue(kinds.contains(.foldedHeaderWithoutParent))
+    XCTAssertTrue(kinds.contains(.malformedHeader))
+    XCTAssertTrue(kinds.contains(.binaryBytesInHeaders))
+    XCTAssertTrue(kinds.contains(.missingMultipartBoundary))
+    XCTAssertTrue(kinds.contains(.unterminatedMultipartBoundary))
+    XCTAssertTrue(kinds.contains(.invalidBase64))
+    XCTAssertTrue(kinds.contains(.malformedQuotedPrintable))
+    XCTAssertTrue(kinds.contains(.unknownTransferEncoding))
+    XCTAssertTrue(kinds.contains(.invalidOrUnknownCharset))
+    XCTAssertTrue(kinds.contains(.missingContentType))
+    XCTAssertTrue(kinds.contains(.contradictoryContentTypeAndBody))
+    XCTAssertTrue(kinds.contains(.attachmentMissingFilename))
+    XCTAssertTrue(kinds.contains(.unsafeAttachmentFilename))
+    XCTAssertTrue(kinds.contains(.duplicateContentID))
+    XCTAssertTrue(kinds.contains(.referencedInlineContentIDNotFound))
+    XCTAssertTrue(kinds.contains(.zeroByteAttachment))
+    XCTAssertTrue(kinds.contains(.exactDuplicateMessageHash))
+    XCTAssertEqual(report.estimatedRemovedDuplicateCount, 1)
+    XCTAssertGreaterThan(report.suggestions.count, 0)
+  }
+
+  func testRecoveryScannerDetectsMalformedMBOXAndTruncatedFinalMessage() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("truncated.mbox")
+    let content = """
+      From bad separator
+      From sender@example.test Thu Jan 01 00:00:00 2026
+      Message-ID: <truncated@example.test>
+      Subject: Truncated
+      From: Sender <sender@example.test>
+      To: Recipient <recipient@example.test>
+      Date: Thu, 1 Jan 2026 00:00:00 +0000
+
+      Body without final newline
+      """
+    try content.write(to: fileURL, atomically: true, encoding: .utf8)
+
+    let report = try await RecoveryScanner().scan(
+      source: MailSourceDescriptor(name: "truncated.mbox", kind: .mbox, location: fileURL)
+    )
+    let kinds = Set(report.issues.map(\.kind))
+
+    XCTAssertTrue(kinds.contains(.malformedFromSeparator))
+    XCTAssertTrue(kinds.contains(.truncatedFinalMessage))
+  }
+
+  func testRecoveryReportJSONAndMarkdownDoNotContainBodiesByDefault() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("report.mbox")
+    try writeMBOX(
+      messages: [
+        rawMessage(
+          ["Subject: Missing", "From: Sender <sender@example.test>", "Date: bad"],
+          body: "PRIVATE BODY SHOULD NOT EXPORT\n"
+        )
+      ],
+      to: fileURL
+    )
+
+    let report = try await RecoveryScanner().scan(
+      source: MailSourceDescriptor(name: "report.mbox", kind: .mbox, location: fileURL)
+    )
+    let json = String(data: try report.jsonData(), encoding: .utf8) ?? ""
+    let markdown = report.markdown()
+
+    XCTAssertFalse(json.contains("PRIVATE BODY SHOULD NOT EXPORT"))
+    XCTAssertFalse(markdown.contains("PRIVATE BODY SHOULD NOT EXPORT"))
+    XCTAssertTrue(markdown.contains("Mail Surgeon Recovery Report"))
+  }
+
+  func testRecoveryExportDeduplicatesEscapesAndKeepsSourceByteIdentical() async throws {
+    let directory = try makeTemporaryDirectory()
+    let safeDirectory = try makeSafeOutputDirectory()
+    let sourceURL = directory.appendingPathComponent("export.mbox")
+    let duplicate = message(
+      id: "duplicate@example.test",
+      subject: "Duplicate",
+      extraHeaders: [],
+      body: "From body@example.test is not a delimiter\nBody\n"
+    )
+    try writeMBOX(messages: [duplicate, duplicate], to: sourceURL)
+    let original = try Data(contentsOf: sourceURL)
+    let source = MailSourceDescriptor(name: "export.mbox", kind: .mbox, location: sourceURL)
+    let report = try await RecoveryScanner().scan(source: source)
+    let destination = safeDirectory.appendingPathComponent("deduped.mbox")
+
+    let result = try await RecoveryExportService().export(
+      source: source,
+      report: report,
+      mode: .deduplicated,
+      destination: destination
+    )
+
+    let output = try String(contentsOf: destination, encoding: .utf8)
+    XCTAssertEqual(result.exportedMessageCount, 1)
+    XCTAssertEqual(result.excludedDuplicateCount, 1)
+    XCTAssertTrue(output.contains(">From body@example.test is not a delimiter"))
+    XCTAssertEqual(try Data(contentsOf: sourceURL), original)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.reportURL.path))
+    XCTAssertFalse(
+      try FileManager.default.contentsOfDirectory(atPath: safeDirectory.path).contains {
+        $0.contains(".tmp-")
+      }
+    )
+  }
+
+  func testRecoveryExportQuarantinesCriticalMessages() async throws {
+    let directory = try makeTemporaryDirectory()
+    let safeDirectory = try makeSafeOutputDirectory()
+    let sourceURL = directory.appendingPathComponent("quarantine.mbox")
+    try writeMBOX(
+      messages: [
+        "",
+        message(id: "good@example.test", subject: "Good", extraHeaders: [], body: "Body\n"),
+      ],
+      to: sourceURL
+    )
+    let source = MailSourceDescriptor(name: "quarantine.mbox", kind: .mbox, location: sourceURL)
+    let report = try await RecoveryScanner().scan(source: source)
+    let destination = safeDirectory.appendingPathComponent("recoverable.mbox")
+
+    let result = try await RecoveryExportService().export(
+      source: source,
+      report: report,
+      mode: .recoverableOnly,
+      destination: destination
+    )
+
+    XCTAssertEqual(result.quarantinedMessageCount, 1)
+    XCTAssertEqual(result.exportedMessageCount, 1)
+    XCTAssertNotNil(result.quarantineURL)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+  }
+
+  func testRecoveryExportRejectsDestinationEqualToSource() async throws {
+    let directory = try makeTemporaryDirectory()
+    let sourceURL = directory.appendingPathComponent("same.mbox")
+    try writeMBOX(
+      messages: [
+        message(id: "same@example.test", subject: "Same", extraHeaders: [], body: "Body\n")
+      ],
+      to: sourceURL
+    )
+    let source = MailSourceDescriptor(name: "same.mbox", kind: .mbox, location: sourceURL)
+    let report = try await RecoveryScanner().scan(source: source)
+
+    do {
+      _ = try await RecoveryExportService().export(
+        source: source,
+        report: report,
+        mode: .preserveAll,
+        destination: sourceURL
+      )
+      XCTFail("Expected source/destination rejection.")
+    } catch RecoveryError.sourceAndDestinationMatch {
+      // Expected.
+    } catch {
+      XCTFail("Expected sourceAndDestinationMatch, got \(error).")
+    }
+  }
+
+  func testRecoveryPersistenceReopenAndFingerprintInvalidation() async throws {
+    let directory = try makeTemporaryDirectory()
+    let fileURL = directory.appendingPathComponent("persist.mbox")
+    try writeMBOX(
+      messages: [
+        rawMessage(
+          ["Subject: Missing", "From: Sender <sender@example.test>", "Date: bad"],
+          body: "Body\n"
+        )
+      ],
+      to: fileURL
+    )
+    let source = MailSourceDescriptor(name: "persist.mbox", kind: .mbox, location: fileURL)
+    let report = try await RecoveryScanner().scan(source: source)
+    let databaseURL = directory.appendingPathComponent("recovery.sqlite")
+
+    try MailIndexStore(databaseURL: databaseURL).saveRecoveryReport(report)
+    let reopened = try MailIndexStore(databaseURL: databaseURL)
+    XCTAssertEqual(try reopened.schemaVersion(), MailIndexStore.currentSchemaVersion)
+    let current = try MailIndexingService.fingerprint(for: source)
+    XCTAssertEqual(
+      try reopened.latestRecoveryReport(sourceID: source.id, currentFingerprint: current)?.id,
+      report.id
+    )
+
+    let handle = try FileHandle(forWritingTo: fileURL)
+    defer { try? handle.close() }
+    try handle.seekToEnd()
+    handle.write(Data("changed\n".utf8))
+    XCTAssertNil(
+      try reopened.latestRecoveryReport(
+        sourceID: source.id,
+        currentFingerprint: try MailIndexingService.fingerprint(for: source)
+      )
+    )
+  }
+
+  func testRecoveryExportCancellationCleansTemporaryOutput() async throws {
+    let directory = try makeTemporaryDirectory()
+    let safeDirectory = try makeSafeOutputDirectory()
+    let sourceURL = directory.appendingPathComponent("cancel.mbox")
+    let messages = (0..<2_000).map {
+      message(
+        id: "cancel-\($0)@example.test", subject: "Cancel \($0)", extraHeaders: [], body: "Body\n")
+    }
+    try writeMBOX(messages: messages, to: sourceURL)
+    let source = MailSourceDescriptor(name: "cancel.mbox", kind: .mbox, location: sourceURL)
+    let report = try await RecoveryScanner().scan(source: source)
+    let destination = safeDirectory.appendingPathComponent("cancel-output.mbox")
+
+    let task = Task {
+      try await RecoveryExportService().export(
+        source: source,
+        report: report,
+        mode: .preserveAll,
+        destination: destination
+      )
+    }
+    task.cancel()
+    do {
+      _ = try await task.value
+    } catch is CancellationError {
+      // Expected.
+    } catch {
+      // Fast machines may complete before cancellation; other errors should still fail.
+      XCTFail("Unexpected cancellation error: \(error)")
+    }
+
+    XCTAssertFalse(
+      try FileManager.default.contentsOfDirectory(atPath: safeDirectory.path).contains {
+        $0.contains(".tmp-")
+      }
+    )
+  }
+
   private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("MailSurgeonTests")
@@ -950,6 +1360,22 @@ final class MailSurgeonTests: XCTestCase {
       "From sender\(index)@example.test Thu Jan 01 00:00:00 2026\n\(message)"
     }.joined()
     try content.write(to: url, atomically: true, encoding: .utf8)
+  }
+
+  private func rawMessage(_ headers: [String], body: String) -> String {
+    headers.joined(separator: "\n") + "\n\n" + body
+  }
+
+  private func makeSafeOutputDirectory() throws -> URL {
+    let url = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .appendingPathComponent(".build")
+      .appendingPathComponent("recovery-test-output")
+      .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
   }
 
   private func message(

@@ -27,14 +27,28 @@ final class AppModel: ObservableObject {
   @Published var isIndexSearchActive = false
   @Published var indexedResultTotal = 0
   @Published var messagePageOffset = 0
+  @Published var recoveryProgress: RecoveryScanProgress = .idle
+  @Published var recoveryReport: RecoveryReport?
+  @Published var recoveryErrorMessage: String?
+  @Published var isRecoveryScanning = false
+  @Published var recoveryIssueSearchText = ""
+  @Published var enabledRecoverySeverities: Set<RecoverySeverity> = []
+  @Published var selectedRecoveryIssueKind: RecoveryIssueKind?
+  @Published var selectedRecoveryIssueID: String?
+  @Published var recoveryIssueSortOrder: [KeyPathComparator<RecoveryIssue>] = [
+    KeyPathComparator(\.severitySortKey)
+  ]
 
   private let analyzer = MailAnalyzer()
   private let browser = MessageBrowser()
   private let bookmarkStore = SecurityScopedBookmarkStore()
   private let indexer = MailIndexingService()
+  private let recoveryScanner = RecoveryScanner()
+  private let recoveryExporter = RecoveryExportService()
   private let searchQueryParser = SearchQueryParser()
   private var indexStore: MailIndexStore?
   private let messagePageLimit = 200
+  private var recoveryTask: Task<Void, Never>?
 
   var selectedSource: MailSourceDescriptor? {
     guard let selectedSourceID else { return nil }
@@ -59,6 +73,44 @@ final class AppModel: ObservableObject {
   var selectedMessage: MailMessageRecord? {
     guard let selectedMessageID else { return nil }
     return messages.first { $0.id == selectedMessageID }
+  }
+
+  var displayedRecoveryIssues: [RecoveryIssue] {
+    let trimmedSearch = recoveryIssueSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let filtered = (recoveryReport?.issues ?? []).filter { issue in
+      if !enabledRecoverySeverities.isEmpty,
+        !enabledRecoverySeverities.contains(issue.severity)
+      {
+        return false
+      }
+      if let selectedRecoveryIssueKind, issue.kind != selectedRecoveryIssueKind {
+        return false
+      }
+      if !trimmedSearch.isEmpty {
+        let haystack = [
+          issue.title,
+          issue.technicalExplanation,
+          issue.kind.label,
+          issue.messageSummaryID ?? "",
+        ].joined(separator: " ")
+        if !haystack.localizedCaseInsensitiveContains(trimmedSearch) {
+          return false
+        }
+      }
+      return true
+    }
+    guard !recoveryIssueSortOrder.isEmpty else { return filtered }
+    return filtered.sorted(using: recoveryIssueSortOrder)
+  }
+
+  var selectedRecoveryIssue: RecoveryIssue? {
+    guard let selectedRecoveryIssueID else { return nil }
+    return recoveryReport?.issues.first { $0.id == selectedRecoveryIssueID }
+  }
+
+  var selectedRecoverySuggestion: RecoverySuggestion? {
+    guard let selectedRecoveryIssue else { return nil }
+    return recoveryReport?.suggestions.first { $0.issueID == selectedRecoveryIssue.id }
   }
 
   init() {
@@ -361,6 +413,17 @@ final class AppModel: ObservableObject {
   }
 
   func runDryAnalysis() async {
+    await runRecoveryDryRun()
+  }
+
+  func startRecoveryDryRun() {
+    recoveryTask?.cancel()
+    recoveryTask = Task { [weak self] in
+      await self?.runRecoveryDryRun()
+    }
+  }
+
+  func runRecoveryDryRun() async {
     guard let selectedSourceID,
       let source = sources.first(where: { $0.id == selectedSourceID })
     else {
@@ -369,28 +432,143 @@ final class AppModel: ObservableObject {
     }
 
     isWorking = true
+    isRecoveryScanning = true
+    recoveryErrorMessage = nil
+    recoveryReport = nil
     analysis = .empty
     progress = AnalysisProgress(
       messagesScanned: 0,
       bytesScanned: 0,
-      status: "Probíhá bezpečná analýza…"
+      status: "Probíhá recovery dry run…"
+    )
+    recoveryProgress = RecoveryScanProgress(
+      status: .running,
+      messagesScanned: 0,
+      bytesScanned: 0,
+      totalBytes: 0,
+      issuesFound: 0,
+      startedAt: Date(),
+      completedAt: nil,
+      statusText: "Probíhá recovery dry run…"
     )
     statusMessage = progress.status
-    defer { isWorking = false }
+    defer {
+      isWorking = false
+      isRecoveryScanning = false
+      recoveryTask = nil
+    }
 
     do {
-      analysis = try await analyzer.analyze(source: source) { [weak self] progress in
-        self?.progress = progress
-        self?.statusMessage = progress.status
+      let report = try await recoveryScanner.scan(source: source) { [weak self] recoveryProgress in
+        self?.recoveryProgress = recoveryProgress
+        self?.progress = AnalysisProgress(
+          messagesScanned: recoveryProgress.messagesScanned,
+          bytesScanned: recoveryProgress.bytesScanned,
+          status: recoveryProgress.statusText
+        )
+        self?.statusMessage = recoveryProgress.statusText
       }
-      statusMessage = "Analýza dokončena. Nebyly provedeny žádné změny."
+      recoveryReport = report
+      try indexStore?.saveRecoveryReport(report)
+      analysis = MailboxAnalysis(
+        totalMessages: report.totalMessagesScanned,
+        totalBytes: report.totalBytesScanned,
+        exactDuplicates: report.estimatedRemovedDuplicateCount,
+        likelyNewsletters: analysis.likelyNewsletters,
+        likelyOneTimeCodes: analysis.likelyOneTimeCodes,
+        largeMessages: analysis.largeMessages,
+        sensitiveCandidates: analysis.sensitiveCandidates
+      )
+      statusMessage = "Recovery dry run dokončen. Zdrojový mailbox zůstal beze změny."
       progress = AnalysisProgress(
-        messagesScanned: analysis.totalMessages,
-        bytesScanned: analysis.totalBytes,
+        messagesScanned: report.totalMessagesScanned,
+        bytesScanned: report.totalBytesScanned,
         status: statusMessage
       )
+    } catch is CancellationError {
+      recoveryProgress.status = .cancelled
+      statusMessage = "Recovery dry run byl zrušen. Zdrojový mailbox zůstal beze změny."
     } catch {
+      recoveryErrorMessage = error.localizedDescription
       statusMessage = "Analýza selhala: \(error.localizedDescription)"
+    }
+  }
+
+  func cancelRecoveryScan() {
+    recoveryTask?.cancel()
+    recoveryProgress.status = .cancelled
+    statusMessage = "Recovery scan se ruší…"
+  }
+
+  func exportRecoveryReportJSON() {
+    guard let recoveryReport else {
+      statusMessage = "Nejdřív spusť recovery dry run."
+      return
+    }
+    let panel = NSSavePanel()
+    panel.title = "Export Recovery JSON"
+    panel.message = "Report neobsahuje kompletní těla zpráv."
+    panel.prompt = "Exportovat"
+    panel.nameFieldStringValue = "recovery-report.json"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    do {
+      try recoveryReport.jsonData().write(to: url, options: .atomic)
+      statusMessage = "Recovery JSON report uložen."
+    } catch {
+      recoveryErrorMessage = error.localizedDescription
+      statusMessage = "Report nelze uložit: \(error.localizedDescription)"
+    }
+  }
+
+  func exportRecoveryReportMarkdown() {
+    guard let recoveryReport else {
+      statusMessage = "Nejdřív spusť recovery dry run."
+      return
+    }
+    let panel = NSSavePanel()
+    panel.title = "Export Recovery Markdown"
+    panel.message = "Report neobsahuje kompletní těla zpráv."
+    panel.prompt = "Exportovat"
+    panel.nameFieldStringValue = "recovery-report.md"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    do {
+      try recoveryReport.markdown().write(to: url, atomically: true, encoding: .utf8)
+      statusMessage = "Recovery Markdown report uložen."
+    } catch {
+      recoveryErrorMessage = error.localizedDescription
+      statusMessage = "Report nelze uložit: \(error.localizedDescription)"
+    }
+  }
+
+  func exportRecoveryMBOX(mode: RecoveryExportMode) async {
+    guard let source = selectedSource, let recoveryReport else {
+      statusMessage = "Nejdřív spusť recovery dry run."
+      return
+    }
+    let panel = NSSavePanel()
+    panel.title = "Export Recovery MBOX"
+    panel.message = "Vyber nový cílový MBOX. Zdroj nebude přepsán."
+    panel.prompt = "Exportovat"
+    panel.nameFieldStringValue = "\(source.name)-recovered.mbox"
+    guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+    isRecoveryScanning = true
+    defer { isRecoveryScanning = false }
+    do {
+      let result = try await recoveryExporter.export(
+        source: source,
+        report: recoveryReport,
+        mode: mode,
+        destination: destination
+      ) { [weak self] progress in
+        self?.recoveryProgress = progress
+        self?.statusMessage = progress.statusText
+      }
+      statusMessage =
+        "Recovery export hotov: \(result.exportedMessageCount) zpráv, SHA-256 \(String(result.outputSHA256.prefix(12)))."
+    } catch {
+      recoveryErrorMessage = error.localizedDescription
+      statusMessage = "Recovery export selhal: \(error.localizedDescription)"
     }
   }
 

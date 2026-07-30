@@ -18,7 +18,7 @@ enum MailIndexError: LocalizedError {
 }
 
 final class MailIndexStore: @unchecked Sendable {
-  static let currentSchemaVersion = 1
+  static let currentSchemaVersion = 2
 
   private let databaseURL: URL
   private var db: OpaquePointer?
@@ -334,6 +334,150 @@ final class MailIndexStore: @unchecked Sendable {
     }
   }
 
+  func saveRecoveryReport(_ report: RecoveryReport) throws {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let summaryJSON = String(data: try report.jsonData(), encoding: .utf8) ?? "{}"
+
+    try execute("BEGIN IMMEDIATE TRANSACTION")
+    do {
+      try execute(
+        """
+        INSERT INTO recovery_scan_runs (
+            id, source_id, source_name, scanner_version, status, started_at,
+            completed_at, source_file_size, source_modified_at, source_fingerprint,
+            message_count, byte_count, issue_count, report_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            status = excluded.status,
+            completed_at = excluded.completed_at,
+            source_file_size = excluded.source_file_size,
+            source_modified_at = excluded.source_modified_at,
+            source_fingerprint = excluded.source_fingerprint,
+            message_count = excluded.message_count,
+            byte_count = excluded.byte_count,
+            issue_count = excluded.issue_count,
+            report_json = excluded.report_json
+        """,
+        [
+          .text(report.id.uuidString),
+          .text(report.sourceID.uuidString),
+          .text(report.sourceName),
+          .text(report.scannerVersion),
+          .text(RecoveryScanStatus.completed.rawValue),
+          .real(report.startedAt.timeIntervalSince1970),
+          .real(report.completedAt.timeIntervalSince1970),
+          .int(report.sourceFingerprint.fileSize),
+          .real(report.sourceFingerprint.modificationDate?.timeIntervalSince1970),
+          .text(report.sourceFingerprint.lightweightHash),
+          .int(Int64(report.totalMessagesScanned)),
+          .int(report.totalBytesScanned),
+          .int(Int64(report.totalIssues)),
+          .text(summaryJSON),
+        ])
+      try execute("DELETE FROM recovery_issues WHERE run_id = ?", [.text(report.id.uuidString)])
+      try execute(
+        "DELETE FROM recovery_repair_proposals WHERE run_id = ?",
+        [.text(report.id.uuidString)]
+      )
+      for issue in report.issues {
+        let evidenceJSON =
+          String(data: try encoder.encode(issue.evidence), encoding: .utf8) ?? "{}"
+        try execute(
+          """
+          INSERT INTO recovery_issues (
+              id, run_id, source_id, message_summary_id, kind, severity, confidence,
+              title, technical_explanation, byte_offset, byte_length, repairable,
+              suggested_action, evidence_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+          [
+            .text(issue.id),
+            .text(report.id.uuidString),
+            .text(issue.sourceID.uuidString),
+            .text(issue.messageSummaryID),
+            .text(issue.kind.rawValue),
+            .text(issue.severity.rawValue),
+            .text(issue.confidence.rawValue),
+            .text(issue.title),
+            .text(issue.technicalExplanation),
+            .int(issue.byteOffset.map(Int64.init) ?? 0),
+            .int(issue.byteLength ?? 0),
+            .int(issue.isSafelyRepairable ? 1 : 0),
+            .text(issue.suggestedAction.rawValue),
+            .text(evidenceJSON),
+          ])
+      }
+      for proposal in report.suggestions {
+        try execute(
+          """
+          INSERT INTO recovery_repair_proposals (
+              id, run_id, issue_id, action, original_condition, proposed_change,
+              confidence, changes_raw_bytes, metadata_only, requires_user_confirmation
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+          [
+            .text(proposal.id),
+            .text(report.id.uuidString),
+            .text(proposal.issueID),
+            .text(proposal.action.rawValue),
+            .text(proposal.originalCondition),
+            .text(proposal.proposedChange),
+            .text(proposal.confidence.rawValue),
+            .int(proposal.changesRawBytes ? 1 : 0),
+            .int(proposal.metadataOnly ? 1 : 0),
+            .int(proposal.requiresUserConfirmation ? 1 : 0),
+          ])
+      }
+      try execute("COMMIT")
+    } catch {
+      try? execute("ROLLBACK")
+      throw error
+    }
+  }
+
+  func latestRecoveryReport(
+    sourceID: UUID,
+    currentFingerprint: SourceFingerprint?
+  ) throws -> RecoveryReport? {
+    guard
+      let row = try firstRow(
+        """
+        SELECT report_json, source_file_size, source_modified_at, source_fingerprint
+        FROM recovery_scan_runs
+        WHERE source_id = ?
+        ORDER BY completed_at DESC
+        LIMIT 1
+        """,
+        [.text(sourceID.uuidString)],
+        map: { statement in
+          (
+            columnText(statement, 0),
+            sqlite3_column_int64(statement, 1),
+            columnDate(statement, 2),
+            columnText(statement, 3)
+          )
+        }),
+      let reportJSON = row.0,
+      let data = reportJSON.data(using: .utf8)
+    else {
+      return nil
+    }
+
+    if let currentFingerprint {
+      let stored = SourceFingerprint(
+        fileSize: row.1,
+        modificationDate: row.2,
+        lightweightHash: row.3 ?? ""
+      )
+      guard currentFingerprint.matchesStored(stored) else { return nil }
+    }
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(RecoveryReport.self, from: data)
+  }
+
   func schemaVersion() throws -> Int {
     try scalarInt("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1", [])
   }
@@ -353,6 +497,9 @@ final class MailIndexStore: @unchecked Sendable {
     do {
       if version < 1 {
         try migrateToVersion1()
+      }
+      if version < 2 {
+        try migrateToVersion2()
       }
       try execute(
         "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
@@ -483,6 +630,71 @@ final class MailIndexStore: @unchecked Sendable {
       "CREATE INDEX IF NOT EXISTS idx_messages_source_flags ON messages(source_id, category_flags)")
     try execute("CREATE INDEX IF NOT EXISTS idx_recipients_address ON recipients(address)")
     try execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)")
+  }
+
+  private func migrateToVersion2() throws {
+    try execute(
+      """
+      CREATE TABLE IF NOT EXISTS recovery_scan_runs (
+          id TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL,
+          source_name TEXT NOT NULL,
+          scanner_version TEXT NOT NULL,
+          status TEXT NOT NULL,
+          started_at REAL NOT NULL,
+          completed_at REAL,
+          source_file_size INTEGER NOT NULL,
+          source_modified_at REAL,
+          source_fingerprint TEXT NOT NULL,
+          message_count INTEGER NOT NULL,
+          byte_count INTEGER NOT NULL,
+          issue_count INTEGER NOT NULL,
+          report_json TEXT NOT NULL
+      )
+      """)
+    try execute(
+      """
+      CREATE TABLE IF NOT EXISTS recovery_issues (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES recovery_scan_runs(id) ON DELETE CASCADE,
+          source_id TEXT NOT NULL,
+          message_summary_id TEXT,
+          kind TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          title TEXT NOT NULL,
+          technical_explanation TEXT NOT NULL,
+          byte_offset INTEGER,
+          byte_length INTEGER,
+          repairable INTEGER NOT NULL,
+          suggested_action TEXT NOT NULL,
+          evidence_json TEXT NOT NULL
+      )
+      """)
+    try execute(
+      """
+      CREATE TABLE IF NOT EXISTS recovery_repair_proposals (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES recovery_scan_runs(id) ON DELETE CASCADE,
+          issue_id TEXT NOT NULL REFERENCES recovery_issues(id) ON DELETE CASCADE,
+          action TEXT NOT NULL,
+          original_condition TEXT NOT NULL,
+          proposed_change TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          changes_raw_bytes INTEGER NOT NULL,
+          metadata_only INTEGER NOT NULL,
+          requires_user_confirmation INTEGER NOT NULL
+      )
+      """)
+    try execute(
+      "CREATE INDEX IF NOT EXISTS idx_recovery_runs_source ON recovery_scan_runs(source_id, completed_at)"
+    )
+    try execute(
+      "CREATE INDEX IF NOT EXISTS idx_recovery_issues_run_kind ON recovery_issues(run_id, kind)"
+    )
+    try execute(
+      "CREATE INDEX IF NOT EXISTS idx_recovery_issues_run_severity ON recovery_issues(run_id, severity)"
+    )
   }
 
   private func insert(_ entry: IndexedMessageEntry, sourceID: UUID) throws {
