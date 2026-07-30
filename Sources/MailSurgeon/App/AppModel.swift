@@ -71,7 +71,8 @@ final class AppModel: ObservableObject {
     private func addMBOXSource() {
         let panel = NSOpenPanel()
         panel.title = "Vyber MBOX archiv"
-        panel.message = "Vyber .mbox soubor nebo mailbox bundle složku. Mail Surgeon bude pouze číst."
+        panel.message =
+            "Vyber .mbox soubor nebo mailbox bundle složku. Mail Surgeon bude pouze číst."
         panel.prompt = "Vybrat"
         panel.allowsMultipleSelection = false
         panel.canChooseFiles = true
@@ -94,11 +95,12 @@ final class AppModel: ObservableObject {
         )
         do {
             try bookmarkStore.saveBookmark(for: url, id: source.id)
-            bookmarkStore.saveSourceRecord(BookmarkedSourceRecord(
-                id: source.id,
-                name: source.name,
-                kind: source.kind
-            ))
+            bookmarkStore.saveSourceRecord(
+                BookmarkedSourceRecord(
+                    id: source.id,
+                    name: source.name,
+                    kind: source.kind
+                ))
         } catch {
             statusMessage = "Bookmark pro MBOX nelze uložit: \(error.localizedDescription)"
         }
@@ -133,7 +135,8 @@ final class AppModel: ObservableObject {
                 self?.statusMessage = progress.status
             }
             analysis = analysis(from: messages)
-            statusMessage = messages.isEmpty
+            statusMessage =
+                messages.isEmpty
                 ? "Zdroj neobsahuje žádné zprávy."
                 : "Zprávy načteny v read-only režimu."
             progress = AnalysisProgress(
@@ -164,6 +167,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func saveAttachment(_ attachment: MessageAttachmentMetadata) async {
+        guard let record = selectedMessage else {
+            statusMessage = "Nejdřív vyber zprávu."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Uložit přílohu"
+        panel.message = "Vyber cílový soubor. Zdrojový mailbox zůstane beze změny."
+        panel.prompt = "Uložit"
+        panel.nameFieldStringValue =
+            attachment.displayName == "(bez názvu)"
+            ? "attachment"
+            : attachment.displayName
+
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            statusMessage = "Uložení přílohy bylo zrušeno."
+            return
+        }
+
+        do {
+            let data = try await browser.loadAttachmentData(id: attachment.id, for: record)
+            try data.write(to: destination, options: .atomic)
+            statusMessage = "Příloha uložena: \(destination.lastPathComponent)"
+        } catch {
+            browserErrorMessage = error.localizedDescription
+            statusMessage = "Přílohu nelze uložit: \(error.localizedDescription)"
+        }
+    }
+
     func setFilter(_ filter: MessageFilter, enabled: Bool) {
         if enabled {
             enabledMessageFilters.insert(filter)
@@ -174,7 +207,8 @@ final class AppModel: ObservableObject {
 
     func runDryAnalysis() async {
         guard let selectedSourceID,
-              let source = sources.first(where: { $0.id == selectedSourceID }) else {
+            let source = sources.first(where: { $0.id == selectedSourceID })
+        else {
             statusMessage = "Nejdřív vyber zdroj."
             return
         }
@@ -210,20 +244,24 @@ final class AppModel: ObservableObject {
         var staleCount = 0
 
         for record in bookmarkStore.sourceRecords() {
-            guard let resolution = try? bookmarkStore.resolveBookmark(id: record.id) else { continue }
+            guard let resolution = try? bookmarkStore.resolveBookmark(id: record.id) else {
+                continue
+            }
             if resolution.wasStale { staleCount += 1 }
-            restored.append(MailSourceDescriptor(
-                id: record.id,
-                name: record.name,
-                kind: record.kind,
-                location: resolution.url
-            ))
+            restored.append(
+                MailSourceDescriptor(
+                    id: record.id,
+                    name: record.name,
+                    kind: record.kind,
+                    location: resolution.url
+                ))
         }
 
         sources = restored
         selectedSourceID = restored.first?.id
         if !restored.isEmpty {
-            statusMessage = staleCount > 0
+            statusMessage =
+                staleCount > 0
                 ? "Obnoveny MBOX zdroje a \(staleCount) stale bookmarků bylo obnoveno."
                 : "Obnoveny uložené MBOX zdroje."
         }
@@ -243,10 +281,13 @@ final class AppModel: ObservableObject {
             totalMessages: records.count,
             totalBytes: records.reduce(0) { $0 + $1.byteSize },
             exactDuplicates: records.filter { $0.classificationFlags.contains(.duplicate) }.count,
-            likelyNewsletters: records.filter { $0.classificationFlags.contains(.newsletter) }.count,
-            likelyOneTimeCodes: records.filter { $0.classificationFlags.contains(.oneTimeCode) }.count,
+            likelyNewsletters: records.filter { $0.classificationFlags.contains(.newsletter) }
+                .count,
+            likelyOneTimeCodes: records.filter { $0.classificationFlags.contains(.oneTimeCode) }
+                .count,
             largeMessages: records.filter { $0.classificationFlags.contains(.large) }.count,
-            sensitiveCandidates: records.filter { $0.classificationFlags.contains(.sensitive) }.count
+            sensitiveCandidates: records.filter { $0.classificationFlags.contains(.sensitive) }
+                .count
         )
     }
 }

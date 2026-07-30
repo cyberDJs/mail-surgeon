@@ -3,6 +3,7 @@ import Foundation
 
 struct MailMessageParser: Sendable {
     private let headerDecoder = RFC2047Decoder()
+    private let mimeParser = MIMEParser()
 
     func record(
         from rawData: Data,
@@ -47,6 +48,7 @@ struct MailMessageParser: Sendable {
     func detail(from rawData: Data, sourceIdentifier: String) -> MessageDetail {
         let rawMessage = decodeMessage(rawData)
         let headers = parseHeaders(from: rawMessage)
+        let mimeMessage = mimeParser.parse(rawData)
         return MessageDetail(
             sourceIdentifier: sourceIdentifier,
             headers: headers,
@@ -55,9 +57,11 @@ struct MailMessageParser: Sendable {
                 "Subject": header("Subject", in: headers).map(headerDecoder.decode) ?? "",
                 "From": header("From", in: headers).map(headerDecoder.decode) ?? "",
                 "To": header("To", in: headers).map(headerDecoder.decode) ?? "",
-                "Date": header("Date", in: headers) ?? ""
+                "Date": header("Date", in: headers) ?? "",
             ],
-            plainTextPreview: plainTextPreview(from: rawMessage, headers: headers),
+            plainTextPreview: mimeMessage.safePlainTextPreview,
+            attachments: mimeMessage.attachments.map(\.metadata),
+            mimeWarnings: mimeMessage.warnings,
             rawByteSize: Int64(rawData.count),
             rawSHA256: sha256(rawData)
         )
@@ -74,14 +78,16 @@ struct MailMessageParser: Sendable {
         for line in headerBlock.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.first == " " || line.first == "\t" {
                 if let currentName {
-                    headers[currentName, default: ""] += " " + line.trimmingCharacters(in: .whitespaces)
+                    headers[currentName, default: ""] +=
+                        " " + line.trimmingCharacters(in: .whitespaces)
                 }
                 continue
             }
 
             guard let colon = line.firstIndex(of: ":") else { continue }
             let name = String(line[..<colon])
-            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(
+                in: .whitespaces)
             headers[name] = value
             currentName = name
         }
@@ -92,11 +98,17 @@ struct MailMessageParser: Sendable {
         headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }
 
-    func classify(subject: String, headers: [String: String], byteSize: Int64) -> MessageClassificationFlags {
+    func classify(subject: String, headers: [String: String], byteSize: Int64)
+        -> MessageClassificationFlags
+    {
         var flags: MessageClassificationFlags = []
 
-        if headers.keys.contains(where: { $0.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame })
-            || headers.keys.contains(where: { $0.caseInsensitiveCompare("List-ID") == .orderedSame }) {
+        if headers.keys.contains(where: {
+            $0.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame
+        })
+            || headers.keys.contains(where: { $0.caseInsensitiveCompare("List-ID") == .orderedSame }
+            )
+        {
             flags.insert(.newsletter)
         }
 
@@ -136,7 +148,7 @@ struct MailMessageParser: Sendable {
             "EEE, d MMM yyyy HH:mm:ss Z",
             "EEE, dd MMM yyyy HH:mm:ss Z",
             "d MMM yyyy HH:mm:ss Z",
-            "dd MMM yyyy HH:mm:ss Z"
+            "dd MMM yyyy HH:mm:ss Z",
         ]
 
         let formatter = DateFormatter()
@@ -153,22 +165,6 @@ struct MailMessageParser: Sendable {
         if disposition.localizedCaseInsensitiveContains("attachment") { return true }
         return rawMessage.localizedCaseInsensitiveContains("Content-Disposition: attachment")
             || rawMessage.localizedCaseInsensitiveContains("filename=")
-    }
-
-    private func plainTextPreview(from rawMessage: String, headers: [String: String]) -> String? {
-        let contentType = header("Content-Type", in: headers) ?? "text/plain"
-        guard !contentType.localizedCaseInsensitiveContains("text/html") else {
-            return nil
-        }
-
-        let normalized = rawMessage.replacingOccurrences(of: "\r\n", with: "\n")
-        guard let separator = normalized.range(of: "\n\n") else { return nil }
-        let body = String(normalized[separator.upperBound...])
-        guard !body.localizedCaseInsensitiveContains("<html"),
-              !body.localizedCaseInsensitiveContains("<body") else {
-            return nil
-        }
-        return String(body.prefix(8_000))
     }
 
     private func sha256(_ data: Data) -> String {
