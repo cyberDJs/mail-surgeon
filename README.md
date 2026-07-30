@@ -25,6 +25,25 @@ Toto je **Phase 0 scaffold**: běžící SwiftUI kostra, datový model, konektor
 
 Cílová platforma: macOS 14+, Intel i Apple Silicon.
 
+## Running the macOS application
+
+Build the local macOS application bundle:
+
+```bash
+make app
+```
+
+Launch the foreground GUI application:
+
+```bash
+make run
+```
+
+`swift run MailSurgeon` is still useful for executable debugging, but `make run`
+is the supported GUI launch method. It launches the generated bundle at
+`.build/app/MailSurgeon.app`, which is a local build artifact and is not
+committed to Git.
+
 ## Bezpečnostní zásady
 
 - Výchozí režim je dry run.
