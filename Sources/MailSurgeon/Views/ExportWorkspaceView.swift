@@ -32,7 +32,7 @@ struct ExportWorkspaceView: View {
 
       HStack(spacing: 10) {
         Button {
-          model.exportRecoveryReportJSON()
+          Task { await model.exportRecoveryReportJSON() }
         } label: {
           Label("Exportovat JSON report", systemImage: "curlybraces")
         }
@@ -40,7 +40,7 @@ struct ExportWorkspaceView: View {
         .accessibilityLabel("Exportovat JSON report")
 
         Button {
-          model.exportRecoveryReportMarkdown()
+          Task { await model.exportRecoveryReportMarkdown() }
         } label: {
           Label("Exportovat Markdown report", systemImage: "doc.plaintext")
         }

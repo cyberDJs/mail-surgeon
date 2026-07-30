@@ -1,6 +1,4 @@
-import AppKit
 import Foundation
-import UniformTypeIdentifiers
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -39,14 +37,16 @@ final class AppModel: ObservableObject {
   @Published var recoveryIssueSortOrder: [KeyPathComparator<RecoveryIssue>] = [
     KeyPathComparator(\.severitySortKey)
   ]
+  @Published private(set) var isPanelPresented = false
 
   private let analyzer = MailAnalyzer()
   private let browser = MessageBrowser()
-  private let bookmarkStore = SecurityScopedBookmarkStore()
+  private let bookmarkStore: SecurityScopedBookmarkStore
   private let indexer = MailIndexingService()
   private let recoveryScanner = RecoveryScanner()
   private let recoveryExporter = RecoveryExportService()
   private let savePanelProvider: any SavePanelProviding
+  private let openPanelProvider: any OpenPanelProviding
   private let searchQueryParser = SearchQueryParser()
   private var indexStore: MailIndexStore?
   let messagePageLimit = 200
@@ -115,27 +115,32 @@ final class AppModel: ObservableObject {
   }
 
   var canExportRecoveryReport: Bool {
-    recoveryReport != nil && !isRecoveryScanning
+    recoveryReport != nil && !isRecoveryScanning && !isPanelPresented
   }
 
   var canExportRecoveryMBOX: Bool {
-    selectedSource != nil && recoveryReport != nil && !isRecoveryScanning
+    selectedSource != nil && recoveryReport != nil && !isRecoveryScanning && !isPanelPresented
   }
 
   var canSaveSelectedAttachment: Bool {
-    selectedMessage != nil && selectedMessageDetail != nil
+    selectedMessage != nil && selectedMessageDetail != nil && !isPanelPresented
   }
 
-  init(savePanelProvider: any SavePanelProviding = AppKitSavePanelProvider()) {
+  init(
+    savePanelProvider: any SavePanelProviding = AppKitSavePanelProvider(),
+    openPanelProvider: any OpenPanelProviding = AppKitOpenPanelProvider(),
+    bookmarkStore: SecurityScopedBookmarkStore = SecurityScopedBookmarkStore()
+  ) {
     self.savePanelProvider = savePanelProvider
+    self.openPanelProvider = openPanelProvider
+    self.bookmarkStore = bookmarkStore
     indexStore = try? MailIndexStore(databaseURL: MailIndexStore.defaultDatabaseURL())
     restoreBookmarkedSources()
   }
 
-  func addSource(_ kind: MailSourceKind) {
+  func addSource(_ kind: MailSourceKind) async -> UUID? {
     if kind == .mbox {
-      addMBOXSource()
-      return
+      return await addMBOXSource()
     }
 
     let source = MailSourceDescriptor(
@@ -148,26 +153,19 @@ final class AppModel: ObservableObject {
     statusMessage = "Přidán zdroj: \(source.name)"
     resetBrowserState()
     indexProgress = .notIndexed
+    return source.id
   }
 
-  private func addMBOXSource() {
-    let panel = NSOpenPanel()
-    panel.title = "Vyber MBOX archiv"
-    panel.message =
-      "Vyber .mbox soubor nebo mailbox bundle složku. Mail Surgeon bude pouze číst."
-    panel.prompt = "Vybrat"
-    panel.allowsMultipleSelection = false
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = true
-    panel.canCreateDirectories = false
-    panel.resolvesAliases = true
-    if let mboxType = UTType(filenameExtension: "mbox") {
-      panel.allowedContentTypes = [mboxType]
+  private func addMBOXSource() async -> UUID? {
+    guard beginPanelPresentation() else {
+      statusMessage = "Panel pro výběr souboru už je otevřený."
+      return nil
     }
+    defer { finishPanelPresentation() }
 
-    guard panel.runModal() == .OK, let url = panel.url else {
+    guard let url = await openPanelProvider.selectMBOX() else {
       statusMessage = "Výběr MBOX archivu byl zrušen."
-      return
+      return nil
     }
 
     let source = MailSourceDescriptor(
@@ -193,6 +191,7 @@ final class AppModel: ObservableObject {
     indexProgress = .notIndexed
     resetBrowserState()
     statusMessage = "Vybrán MBOX archiv: \(source.name)"
+    return source.id
   }
 
   func loadMessagesForSelectedSource() async {
@@ -415,13 +414,17 @@ final class AppModel: ObservableObject {
 
   func selectMessage(id: String?) async {
     guard selectedMessageID != id else { return }
+    UIActionLogger.debug("message selection command queued")
     selectedMessageID = id
     await loadSelectedMessageDetail()
+    UIActionLogger.debug("message selection command completed")
   }
 
   func selectRecoveryIssue(id: String?) {
     guard selectedRecoveryIssueID != id else { return }
+    UIActionLogger.debug("recovery issue selection command queued")
     selectedRecoveryIssueID = id
+    UIActionLogger.debug("recovery issue selection command completed")
   }
 
   func updateMessageSearchText(_ text: String) {
@@ -440,6 +443,7 @@ final class AppModel: ObservableObject {
     if canUseIndex {
       await refreshIndexedSearch(resetPage: true)
     }
+    clearInvalidMessageSelection()
   }
 
   func updateMessageSortOrder(_ sortOrder: [KeyPathComparator<MailMessageRecord>]) {
@@ -465,6 +469,7 @@ final class AppModel: ObservableObject {
     if canUseIndex {
       await refreshIndexedSearch(resetPage: true)
     }
+    clearInvalidMessageSelection()
   }
 
   func saveAttachment(_ attachment: MessageAttachmentMetadata) async {
@@ -472,6 +477,11 @@ final class AppModel: ObservableObject {
       statusMessage = "Nejdřív vyber zprávu."
       return
     }
+    guard beginPanelPresentation() else {
+      statusMessage = "Panel pro uložení už je otevřený."
+      return
+    }
+    defer { finishPanelPresentation() }
 
     let defaultName =
       attachment.displayName == "(bez názvu)"
@@ -479,7 +489,7 @@ final class AppModel: ObservableObject {
       : attachment.displayName
 
     guard
-      let destination = savePanelProvider.destination(
+      let destination = await savePanelProvider.destination(
         for: .attachment(defaultName: defaultName))
     else {
       statusMessage = "Uložení přílohy bylo zrušeno."
@@ -516,6 +526,7 @@ final class AppModel: ObservableObject {
     if canUseIndex {
       await refreshIndexedSearch(resetPage: true)
     }
+    clearInvalidMessageSelection()
   }
 
   func resetMessageFilters() async {
@@ -524,6 +535,7 @@ final class AppModel: ObservableObject {
     if canUseIndex {
       await refreshIndexedSearch(resetPage: true)
     }
+    clearInvalidMessageSelection()
   }
 
   func setRecoverySeverity(_ severity: RecoverySeverity, enabled: Bool) {
@@ -537,6 +549,27 @@ final class AppModel: ObservableObject {
   func resetRecoveryFilters() {
     enabledRecoverySeverities = []
     selectedRecoveryIssueKind = nil
+    clearInvalidRecoveryIssueSelection()
+  }
+
+  func applyRecoverySeverity(_ severity: RecoverySeverity, enabled: Bool) {
+    if enabled {
+      enabledRecoverySeverities.insert(severity)
+    } else {
+      enabledRecoverySeverities.remove(severity)
+    }
+    clearInvalidRecoveryIssueSelection()
+  }
+
+  func applyRecoveryIssueKind(_ kind: RecoveryIssueKind?) {
+    selectedRecoveryIssueKind = kind
+    clearInvalidRecoveryIssueSelection()
+  }
+
+  func applyRecoveryIssueSearchText(_ text: String) {
+    guard recoveryIssueSearchText != text else { return }
+    recoveryIssueSearchText = text
+    clearInvalidRecoveryIssueSelection()
   }
 
   func runDryAnalysis() async {
@@ -627,13 +660,22 @@ final class AppModel: ObservableObject {
     statusMessage = "Recovery scan se ruší…"
   }
 
-  func exportRecoveryReportJSON() {
+  func exportRecoveryReportJSON() async {
     guard let recoveryReport else {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
+    guard beginPanelPresentation() else {
+      statusMessage = "Panel pro export už je otevřený."
+      return
+    }
+    defer { finishPanelPresentation() }
+
     recoveryErrorMessage = nil
-    guard let url = savePanelProvider.destination(for: .recoveryReportJSON) else { return }
+    guard let url = await savePanelProvider.destination(for: .recoveryReportJSON) else {
+      statusMessage = "Export JSON reportu byl zrušen."
+      return
+    }
     do {
       try recoveryReport.jsonData().write(to: url, options: .atomic)
       statusMessage = "Recovery JSON report uložen."
@@ -643,13 +685,22 @@ final class AppModel: ObservableObject {
     }
   }
 
-  func exportRecoveryReportMarkdown() {
+  func exportRecoveryReportMarkdown() async {
     guard let recoveryReport else {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
+    guard beginPanelPresentation() else {
+      statusMessage = "Panel pro export už je otevřený."
+      return
+    }
+    defer { finishPanelPresentation() }
+
     recoveryErrorMessage = nil
-    guard let url = savePanelProvider.destination(for: .recoveryReportMarkdown) else { return }
+    guard let url = await savePanelProvider.destination(for: .recoveryReportMarkdown) else {
+      statusMessage = "Export Markdown reportu byl zrušen."
+      return
+    }
     do {
       try recoveryReport.markdown().write(to: url, atomically: true, encoding: .utf8)
       statusMessage = "Recovery Markdown report uložen."
@@ -664,11 +715,20 @@ final class AppModel: ObservableObject {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
+    guard beginPanelPresentation() else {
+      statusMessage = "Panel pro export už je otevřený."
+      return
+    }
+    defer { finishPanelPresentation() }
+
     recoveryErrorMessage = nil
     guard
-      let destination = savePanelProvider.destination(
+      let destination = await savePanelProvider.destination(
         for: .recoveryMBOX(defaultName: "\(source.name)-recovered.mbox"))
-    else { return }
+    else {
+      statusMessage = "Export obnoveného MBOXu byl zrušen."
+      return
+    }
 
     isRecoveryScanning = true
     defer { isRecoveryScanning = false }
@@ -728,6 +788,31 @@ final class AppModel: ObservableObject {
     isIndexSearchActive = false
     indexedResultTotal = 0
     messagePageOffset = 0
+  }
+
+  private func clearInvalidMessageSelection() {
+    guard let selectedMessageID,
+      !displayedMessages.contains(where: { $0.id == selectedMessageID })
+    else { return }
+    self.selectedMessageID = nil
+    selectedMessageDetail = nil
+  }
+
+  private func clearInvalidRecoveryIssueSelection() {
+    guard let selectedRecoveryIssueID,
+      !displayedRecoveryIssues.contains(where: { $0.id == selectedRecoveryIssueID })
+    else { return }
+    self.selectedRecoveryIssueID = nil
+  }
+
+  private func beginPanelPresentation() -> Bool {
+    guard !isPanelPresented else { return false }
+    isPanelPresented = true
+    return true
+  }
+
+  private func finishPanelPresentation() {
+    isPanelPresented = false
   }
 
   private var canUseIndex: Bool {

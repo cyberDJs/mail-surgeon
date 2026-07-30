@@ -166,7 +166,7 @@ enum MessageFilter: String, CaseIterable, Identifiable, Sendable {
   }
 }
 
-enum MessageSortColumn: String, Sendable {
+enum MessageSortColumn: String, Hashable, Sendable {
   case date
   case sender
   case subject
@@ -175,7 +175,7 @@ enum MessageSortColumn: String, Sendable {
   case category
 }
 
-struct MessageSortDescriptor: Equatable, Sendable {
+struct MessageSortDescriptor: Equatable, Hashable, Sendable {
   var column: MessageSortColumn
   var ascending: Bool
 
@@ -225,6 +225,10 @@ extension MessageSortDescriptor {
     case .category:
       return [KeyPathComparator(\.categoryLabel, order: order)]
     }
+  }
+
+  var logIdentifier: String {
+    "\(column.rawValue)-\(ascending ? "ascending" : "descending")"
   }
 }
 
