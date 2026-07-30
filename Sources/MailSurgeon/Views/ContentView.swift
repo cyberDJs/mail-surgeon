@@ -28,6 +28,7 @@ struct ContentView: View {
         header
         progressSummary
         indexSummary
+        recoverySection
         analysisGrid
         browserWorkspace
         footer
@@ -174,6 +175,266 @@ struct ContentView: View {
         metric("Velké zprávy", value: "\(model.analysis.largeMessages)", icon: "tray.full")
         Color.clear
         Color.clear
+      }
+    }
+  }
+
+  private var recoverySection: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(spacing: 12) {
+        Label("Recovery", systemImage: "cross.case")
+          .font(.headline)
+        if model.isRecoveryScanning {
+          ProgressView(value: model.recoveryProgress.fractionCompleted)
+            .frame(width: 160)
+        }
+        Text(model.recoveryProgress.statusText)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+        Spacer()
+        Button {
+          model.startRecoveryDryRun()
+        } label: {
+          Label("Dry Run", systemImage: "stethoscope")
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(model.isRecoveryScanning || model.selectedSourceID == nil)
+
+        Button {
+          model.cancelRecoveryScan()
+        } label: {
+          Label("Cancel", systemImage: "xmark.circle")
+        }
+        .buttonStyle(.bordered)
+        .disabled(!model.isRecoveryScanning)
+      }
+
+      if let report = model.recoveryReport {
+        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
+          GridRow {
+            metric("Scanned", value: "\(report.totalMessagesScanned)", icon: "envelope.open")
+            metric("Issues", value: "\(report.totalIssues)", icon: "exclamationmark.triangle")
+            metric("Repairable", value: "\(report.repairableIssueCount)", icon: "wrench.adjustable")
+            metric("Non-repairable", value: "\(report.nonRepairableIssueCount)", icon: "lock")
+          }
+          GridRow {
+            metric(
+              "Critical",
+              value: "\(report.countsBySeverity[.critical, default: 0])",
+              icon: "exclamationmark.octagon"
+            )
+            metric(
+              "Errors",
+              value: "\(report.countsBySeverity[.error, default: 0])",
+              icon: "xmark.octagon"
+            )
+            metric(
+              "Warnings",
+              value: "\(report.countsBySeverity[.warning, default: 0])",
+              icon: "exclamationmark.triangle"
+            )
+            metric(
+              "Info",
+              value: "\(report.countsBySeverity[.info, default: 0])",
+              icon: "info.circle"
+            )
+          }
+        }
+
+        recoveryToolbar(report: report)
+
+        HSplitView {
+          recoveryIssueTable
+            .frame(minWidth: 620, minHeight: 220)
+          recoveryIssueDetail
+            .frame(minWidth: 320, minHeight: 220)
+        }
+        .frame(height: 280)
+      } else if let error = model.recoveryErrorMessage {
+        ContentUnavailableView(
+          "Recovery scan failed",
+          systemImage: "exclamationmark.triangle",
+          description: Text(error)
+        )
+        .frame(height: 110)
+      }
+    }
+  }
+
+  private func recoveryToolbar(report: RecoveryReport) -> some View {
+    HStack(spacing: 10) {
+      TextField("Search issues", text: $model.recoveryIssueSearchText)
+        .textFieldStyle(.roundedBorder)
+        .frame(minWidth: 180)
+
+      ForEach(RecoverySeverity.allCases) { severity in
+        Toggle(
+          severity.label,
+          isOn: Binding(
+            get: { model.enabledRecoverySeverities.contains(severity) },
+            set: { enabled in
+              if enabled {
+                model.enabledRecoverySeverities.insert(severity)
+              } else {
+                model.enabledRecoverySeverities.remove(severity)
+              }
+            }
+          )
+        )
+        .toggleStyle(.checkbox)
+      }
+
+      Picker("Issue Type", selection: $model.selectedRecoveryIssueKind) {
+        Text("All Types").tag(Optional<RecoveryIssueKind>.none)
+        ForEach(RecoveryIssueKind.allCases) { kind in
+          if report.countsByKind[kind, default: 0] > 0 {
+            Text(kind.label).tag(Optional(kind))
+          }
+        }
+      }
+      .frame(width: 220)
+
+      Spacer()
+
+      Menu {
+        Button("Preserve all") {
+          Task { await model.exportRecoveryMBOX(mode: .preserveAll) }
+        }
+        Button("Deduplicated") {
+          Task { await model.exportRecoveryMBOX(mode: .deduplicated) }
+        }
+        Button("Recoverable only") {
+          Task { await model.exportRecoveryMBOX(mode: .recoverableOnly) }
+        }
+      } label: {
+        Label("Export MBOX", systemImage: "square.and.arrow.up")
+      }
+      .disabled(model.isRecoveryScanning)
+
+      Button {
+        model.exportRecoveryReportJSON()
+      } label: {
+        Label("JSON", systemImage: "curlybraces")
+      }
+      .buttonStyle(.bordered)
+
+      Button {
+        model.exportRecoveryReportMarkdown()
+      } label: {
+        Label("Markdown", systemImage: "doc.plaintext")
+      }
+      .buttonStyle(.bordered)
+    }
+    .font(.callout)
+  }
+
+  @ViewBuilder
+  private var recoveryIssueTable: some View {
+    if model.displayedRecoveryIssues.isEmpty {
+      ContentUnavailableView(
+        "No recovery issues",
+        systemImage: "checkmark.seal",
+        description: Text("No issues match the current recovery filters.")
+      )
+    } else {
+      Table(
+        model.displayedRecoveryIssues,
+        selection: $model.selectedRecoveryIssueID,
+        sortOrder: $model.recoveryIssueSortOrder
+      ) {
+        TableColumn("Severity", value: \.severitySortKey) { issue in
+          Text(issue.severity.label)
+        }
+        .width(min: 80, ideal: 90)
+
+        TableColumn("Message date") { issue in
+          Text(
+            issue.evidence["messageDate"]?.isEmpty == false ? issue.evidence["messageDate"]! : "-"
+          )
+          .lineLimit(1)
+        }
+        .width(min: 120, ideal: 160)
+
+        TableColumn("Sender") { issue in
+          Text(issue.evidence["sender"] ?? issue.evidence["senderHash"]?.prefixText ?? "-")
+            .lineLimit(1)
+        }
+        .width(min: 120, ideal: 180)
+
+        TableColumn("Subject") { issue in
+          Text(issue.evidence["subject"] ?? issue.evidence["subjectHash"]?.prefixText ?? "-")
+            .lineLimit(1)
+        }
+        .width(min: 140, ideal: 240)
+
+        TableColumn("Issue") { issue in
+          Text(issue.title)
+            .lineLimit(1)
+        }
+        .width(min: 180, ideal: 260)
+
+        TableColumn("Confidence") { issue in
+          Text(issue.confidence.label)
+        }
+        .width(min: 90, ideal: 100)
+
+        TableColumn("Repairable", value: \.repairableLabel) { issue in
+          Text(issue.repairableLabel)
+        }
+        .width(min: 80, ideal: 90)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var recoveryIssueDetail: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text("Recovery Inspector")
+        .font(.headline)
+      if let issue = model.selectedRecoveryIssue {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 12) {
+            detailSection(
+              "Issue",
+              rows: [
+                "ID": issue.id,
+                "Kind": issue.kind.rawValue,
+                "Severity": issue.severity.label,
+                "Confidence": issue.confidence.label,
+                "Repairable": issue.repairableLabel,
+                "Action": issue.suggestedAction.rawValue,
+                "Offset": issue.byteOffset.map(String.init) ?? "",
+                "Length": issue.byteLength.map(String.init) ?? "",
+              ])
+            detailSection(
+              "Explanation",
+              rows: [
+                "Title": issue.title,
+                "Technical": issue.technicalExplanation,
+              ])
+            detailSection("Evidence", rows: issue.evidence)
+            if let suggestion = model.selectedRecoverySuggestion {
+              detailSection(
+                "Proposed Repair",
+                rows: [
+                  "Action": suggestion.action.rawValue,
+                  "Original": suggestion.originalCondition,
+                  "Change": suggestion.proposedChange,
+                  "Confidence": suggestion.confidence.label,
+                  "Changes raw bytes": suggestion.changesRawBytes ? "Yes" : "No",
+                  "Metadata only": suggestion.metadataOnly ? "Yes" : "No",
+                  "Requires confirmation": suggestion.requiresUserConfirmation ? "Yes" : "No",
+                ])
+            }
+          }
+          .textSelection(.enabled)
+        }
+      } else {
+        ContentUnavailableView(
+          "Select an issue",
+          systemImage: "list.bullet.rectangle",
+          description: Text("Recovery details appear after selecting an issue.")
+        )
       }
     }
   }
@@ -403,7 +664,7 @@ struct ContentView: View {
         .foregroundStyle(.secondary)
       Spacer()
       Button("Spustit dry run") {
-        Task { await model.runDryAnalysis() }
+        model.startRecoveryDryRun()
       }
       .buttonStyle(.borderedProminent)
       .disabled(model.isWorking || model.selectedSourceID == nil)
@@ -460,4 +721,10 @@ struct ContentView: View {
     formatter.timeStyle = .short
     return formatter
   }()
+}
+
+extension String {
+  fileprivate var prefixText: String {
+    String(prefix(12))
+  }
 }
