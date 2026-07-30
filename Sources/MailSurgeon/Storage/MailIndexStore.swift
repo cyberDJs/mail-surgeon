@@ -963,7 +963,9 @@ final class MailIndexStore: @unchecked Sendable {
         }
       case .text(let value):
         if let value {
-          result = sqlite3_bind_text(statement, position, value, -1, sqliteTransient)
+          result = value.withCString { pointer in
+            sqlite3_bind_text(statement, position, pointer, -1, sqliteTransient)
+          }
         } else {
           result = sqlite3_bind_null(statement, position)
         }
