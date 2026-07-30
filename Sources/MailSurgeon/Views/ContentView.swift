@@ -17,7 +17,7 @@ struct ContentView: View {
             .toolbar {
                 Menu {
                     ForEach(MailSourceKind.allCases) { kind in
-                        Button(kind.rawValue) { model.addDemoSource(kind) }
+                        Button(kind.rawValue) { model.addSource(kind) }
                     }
                 } label: {
                     Label("Přidat zdroj", systemImage: "plus")
@@ -26,6 +26,7 @@ struct ContentView: View {
         } detail: {
             VStack(alignment: .leading, spacing: 20) {
                 header
+                progressSummary
                 analysisGrid
                 Spacer()
                 HStack {
@@ -40,6 +41,22 @@ struct ContentView: View {
                 }
             }
             .padding(24)
+        }
+    }
+
+    private var progressSummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if model.isWorking {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            HStack(spacing: 18) {
+                Label("\(model.progress.messagesScanned) zpráv", systemImage: "envelope.open")
+                Label(ByteCountFormatter.string(fromByteCount: model.progress.bytesScanned, countStyle: .file), systemImage: "doc.text.magnifyingglass")
+                Text(model.progress.status)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.callout)
         }
     }
 
@@ -63,6 +80,11 @@ struct ContentView: View {
                 metric("Newslettery", value: "\(model.analysis.likelyNewsletters)", icon: "megaphone")
                 metric("OTP", value: "\(model.analysis.likelyOneTimeCodes)", icon: "number.square")
                 metric("Citlivé", value: "\(model.analysis.sensitiveCandidates)", icon: "lock.shield")
+            }
+            GridRow {
+                metric("Velké zprávy", value: "\(model.analysis.largeMessages)", icon: "tray.full")
+                Color.clear
+                Color.clear
             }
         }
     }

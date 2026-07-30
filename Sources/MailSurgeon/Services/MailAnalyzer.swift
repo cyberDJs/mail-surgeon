@@ -1,44 +1,75 @@
 import Foundation
 
-struct MailAnalyzer {
+struct MailAnalyzer: Sendable {
     private let factory = ConnectorFactory()
 
-    func analyze(source: MailSourceDescriptor) async throws -> MailboxAnalysis {
+    func analyze(
+        source: MailSourceDescriptor,
+        progress: (@MainActor @Sendable (AnalysisProgress) -> Void)? = nil
+    ) async throws -> MailboxAnalysis {
         let connector = factory.makeConnector(for: source)
         try await connector.validateAccess()
 
-        var messages: [MailMessageRecord] = []
+        await progress?(AnalysisProgress(
+            messagesScanned: 0,
+            bytesScanned: 0,
+            status: "Připravuji čtení: \(source.name)"
+        ))
+
+        var totalMessages = 0
+        var totalBytes: Int64 = 0
+        var exactDuplicates = 0
+        var likelyNewsletters = 0
+        var likelyOneTimeCodes = 0
+        var largeMessages = 0
+        var sensitiveCandidates = 0
+        var hashes: [String: Int] = [:]
+
         for try await message in connector.scanMessages() {
-            messages.append(message)
+            totalMessages += 1
+            totalBytes += message.byteSize
+
+            let existingHashCount = hashes[message.rawSHA256, default: 0]
+            if existingHashCount > 0 {
+                exactDuplicates += 1
+            }
+            hashes[message.rawSHA256] = existingHashCount + 1
+
+            if message.headers.keys.contains(where: { $0.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame })
+                || message.headers.keys.contains(where: { $0.caseInsensitiveCompare("List-ID") == .orderedSame })
+            {
+                likelyNewsletters += 1
+            }
+
+            let otpTerms = ["verification code", "one-time password", "otp", "ověřovací kód"]
+            if otpTerms.contains(where: { message.subject.localizedCaseInsensitiveContains($0) }) {
+                likelyOneTimeCodes += 1
+            }
+
+            if message.byteSize >= 25 * 1_024 * 1_024 {
+                largeMessages += 1
+            }
+
+            let sensitiveTerms = ["invoice", "faktura", "smlouva", "contract", "bank", "úřad"]
+            if sensitiveTerms.contains(where: { message.subject.localizedCaseInsensitiveContains($0) }) {
+                sensitiveCandidates += 1
+            }
+
+            await progress?(AnalysisProgress(
+                messagesScanned: totalMessages,
+                bytesScanned: totalBytes,
+                status: "Skenuji: \(message.folderPath)"
+            ))
         }
 
-        let duplicateCount = Dictionary(grouping: messages, by: \.rawSHA256)
-            .values
-            .reduce(0) { partial, group in partial + max(0, group.count - 1) }
-
-        let newsletters = messages.filter { message in
-            message.headers.keys.contains { $0.caseInsensitiveCompare("List-Unsubscribe") == .orderedSame }
-                || message.headers.keys.contains { $0.caseInsensitiveCompare("List-ID") == .orderedSame }
-        }.count
-
-        let otpTerms = ["verification code", "one-time password", "otp", "ověřovací kód"]
-        let otpCount = messages.filter { message in
-            otpTerms.contains { message.subject.localizedCaseInsensitiveContains($0) }
-        }.count
-
-        let sensitiveTerms = ["invoice", "faktura", "smlouva", "contract", "bank", "úřad"]
-        let sensitiveCount = messages.filter { message in
-            sensitiveTerms.contains { message.subject.localizedCaseInsensitiveContains($0) }
-        }.count
-
         return MailboxAnalysis(
-            totalMessages: messages.count,
-            totalBytes: messages.reduce(0) { $0 + $1.byteSize },
-            exactDuplicates: duplicateCount,
-            likelyNewsletters: newsletters,
-            likelyOneTimeCodes: otpCount,
-            largeMessages: messages.filter { $0.byteSize >= 25 * 1_024 * 1_024 }.count,
-            sensitiveCandidates: sensitiveCount
+            totalMessages: totalMessages,
+            totalBytes: totalBytes,
+            exactDuplicates: exactDuplicates,
+            likelyNewsletters: likelyNewsletters,
+            likelyOneTimeCodes: likelyOneTimeCodes,
+            largeMessages: largeMessages,
+            sensitiveCandidates: sensitiveCandidates
         )
     }
 }

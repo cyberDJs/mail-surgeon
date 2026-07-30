@@ -1,6 +1,6 @@
 import Foundation
 
-struct ConnectorFactory {
+struct ConnectorFactory: Sendable {
     func makeConnector(for source: MailSourceDescriptor) -> any MailSourceConnector {
         switch source.kind {
         case .imap:
@@ -8,7 +8,7 @@ struct ConnectorFactory {
         case .appleMail:
             PlaceholderConnector(descriptor: source, feature: "Apple Mail reader")
         case .mbox:
-            PlaceholderConnector(descriptor: source, feature: "MBOX parser")
+            MBOXConnector(descriptor: source)
         case .eml:
             PlaceholderConnector(descriptor: source, feature: "EML/EMLX parser")
         case .maildir:

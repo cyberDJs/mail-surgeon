@@ -1,6 +1,6 @@
 import Foundation
 
-struct MailSourceDescriptor: Identifiable, Hashable {
+struct MailSourceDescriptor: Identifiable, Hashable, Sendable {
     let id: UUID
     var name: String
     var kind: MailSourceKind
@@ -14,7 +14,7 @@ struct MailSourceDescriptor: Identifiable, Hashable {
     }
 }
 
-enum MailSourceKind: String, CaseIterable, Identifiable {
+enum MailSourceKind: String, CaseIterable, Identifiable, Sendable {
     case imap = "IMAP"
     case appleMail = "Apple Mail"
     case mbox = "MBOX"
@@ -34,7 +34,7 @@ enum MailSourceKind: String, CaseIterable, Identifiable {
     }
 }
 
-struct MailMessageRecord: Identifiable, Hashable {
+struct MailMessageRecord: Identifiable, Hashable, Sendable {
     let id: UUID
     let sourceIdentifier: String
     let folderPath: String
@@ -77,7 +77,7 @@ struct MailMessageRecord: Identifiable, Hashable {
     }
 }
 
-struct MailboxAnalysis {
+struct MailboxAnalysis: Equatable, Sendable {
     var totalMessages: Int
     var totalBytes: Int64
     var exactDuplicates: Int
@@ -97,7 +97,19 @@ struct MailboxAnalysis {
     )
 }
 
-enum CleanupRecommendation: String, CaseIterable {
+struct AnalysisProgress: Equatable, Sendable {
+    var messagesScanned: Int
+    var bytesScanned: Int64
+    var status: String
+
+    static let idle = AnalysisProgress(
+        messagesScanned: 0,
+        bytesScanned: 0,
+        status: "Připraveno."
+    )
+}
+
+enum CleanupRecommendation: String, CaseIterable, Sendable {
     case keep = "Ponechat"
     case archive = "Archivovat"
     case review = "Zkontrolovat"
