@@ -276,12 +276,14 @@ final class MailIndexStore: @unchecked Sendable {
   func search(
     sourceID: UUID,
     query: ParsedSearchQuery,
+    sort: MessageSortDescriptor = .newestFirst,
     limit: Int,
     offset: Int
   ) throws -> MailIndexPage {
     let boundedLimit = max(1, min(limit, 500))
     let boundedOffset = max(0, offset)
     let whereClause = try buildWhereClause(sourceID: sourceID, query: query)
+    let orderBy = orderByClause(for: sort)
     let count = try scalarInt("SELECT COUNT(*) \(whereClause.sql)", whereClause.bindings)
     let rows = try allRows(
       """
@@ -290,7 +292,7 @@ final class MailIndexStore: @unchecked Sendable {
              m.has_attachments, m.file_path, m.source_offset, m.source_length,
              m.category_flags
       \(whereClause.sql)
-      ORDER BY m.sent_at DESC, m.id ASC
+      ORDER BY \(orderBy), m.id ASC
       LIMIT ? OFFSET ?
       """,
       whereClause.bindings + [.int(Int64(boundedLimit)), .int(Int64(boundedOffset))]
@@ -699,6 +701,14 @@ final class MailIndexStore: @unchecked Sendable {
 
   private func insert(_ entry: IndexedMessageEntry, sourceID: UUID) throws {
     let folderID = try folderID(sourceID: sourceID, path: entry.record.folderPath)
+
+    let containsSensitiveContent =
+      entry.record.classificationFlags.contains(.oneTimeCode)
+      || entry.record.classificationFlags.contains(.sensitive)
+
+    let storedPreviewExcerpt =
+      containsSensitiveContent ? "[REDACTED: sensitive message preview]" : entry.previewExcerpt
+
     try execute(
       """
       INSERT INTO messages (
@@ -718,7 +728,7 @@ final class MailIndexStore: @unchecked Sendable {
         .int(entry.record.hasAttachments ? 1 : 0),
         .int(Int64(entry.attachments.count)),
         .int(Int64(entry.record.classificationFlags.rawValue)),
-        .text(entry.previewExcerpt), .real(Date().timeIntervalSince1970),
+        .text(storedPreviewExcerpt), .real(Date().timeIntervalSince1970),
       ])
     let messagePK = sqlite3_last_insert_rowid(db)
     for recipient in entry.record.recipients {
@@ -752,7 +762,7 @@ final class MailIndexStore: @unchecked Sendable {
       [
         .text(sourceID.uuidString), .int(messagePK), .text(entry.record.subject),
         .text(entry.record.sender), .text(entry.record.recipients.joined(separator: " ")),
-        .text(entry.previewExcerpt),
+        .text(storedPreviewExcerpt),
       ])
   }
 
@@ -846,6 +856,34 @@ final class MailIndexStore: @unchecked Sendable {
     return ("\(joins) WHERE \(conditions.joined(separator: " AND "))", bindings)
   }
 
+  private func orderByClause(for sort: MessageSortDescriptor) -> String {
+    let direction = sort.ascending ? "ASC" : "DESC"
+    switch sort.column {
+    case .date:
+      return "m.sent_at \(direction)"
+    case .sender:
+      return "m.sender COLLATE NOCASE \(direction)"
+    case .subject:
+      return "m.subject COLLATE NOCASE \(direction)"
+    case .size:
+      return "m.byte_size \(direction)"
+    case .attachment:
+      return "m.has_attachments \(direction)"
+    case .category:
+      return """
+        CASE
+        WHEN m.category_flags = 0 THEN 'Běžné'
+        WHEN (m.category_flags & \(MessageClassificationFlags.sensitive.rawValue)) != 0 THEN 'Citlivé'
+        WHEN (m.category_flags & \(MessageClassificationFlags.duplicate.rawValue)) != 0 THEN 'Duplicitní'
+        WHEN (m.category_flags & \(MessageClassificationFlags.newsletter.rawValue)) != 0 THEN 'Newsletter'
+        WHEN (m.category_flags & \(MessageClassificationFlags.oneTimeCode.rawValue)) != 0 THEN 'OTP'
+        WHEN (m.category_flags & \(MessageClassificationFlags.large.rawValue)) != 0 THEN 'Velké'
+        ELSE ''
+        END COLLATE NOCASE \(direction)
+        """
+    }
+  }
+
   private func escapeLike(_ value: String) -> String {
     value
       .replacingOccurrences(of: "\\", with: "\\\\")
@@ -933,7 +971,9 @@ final class MailIndexStore: @unchecked Sendable {
         }
       case .text(let value):
         if let value {
-          result = sqlite3_bind_text(statement, position, value, -1, sqliteTransient)
+          result = value.withCString { pointer in
+            sqlite3_bind_text(statement, position, pointer, -1, sqliteTransient)
+          }
         } else {
           result = sqlite3_bind_null(statement, position)
         }

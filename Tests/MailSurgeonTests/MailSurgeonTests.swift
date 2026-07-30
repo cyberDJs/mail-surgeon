@@ -204,6 +204,51 @@ final class MailSurgeonTests: XCTestCase {
           \.categoryLabel), ["Newsletter", "OTP"])
   }
 
+  @MainActor
+  func testAppModelSearchQueryStateFiltersInMemoryMessages() {
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.indexProgress = .notIndexed
+    model.messages = [
+      record(subject: "Invoice", sender: "Billing <billing@example.test>"),
+      record(subject: "Newsletter", sender: "News <news@example.test>"),
+    ]
+
+    model.updateMessageSearchText("billing")
+
+    XCTAssertEqual(model.messageSearchText, "billing")
+    XCTAssertEqual(model.displayedMessages.map(\.subject), ["Invoice"])
+  }
+
+  func testMessageSortDescriptorMapsTableSortOrderAndToggle() throws {
+    let senderSort = MessageSortDescriptor(
+      sortOrder: [KeyPathComparator(\MailMessageRecord.sender, order: .forward)]
+    )
+
+    XCTAssertEqual(senderSort, MessageSortDescriptor(column: .sender, ascending: true))
+    XCTAssertEqual(senderSort?.toggled(), MessageSortDescriptor(column: .sender, ascending: false))
+    XCTAssertEqual(
+      MessageSortDescriptor(column: .size, ascending: false).sortOrder.first?.keyPath,
+      \MailMessageRecord.byteSize
+    )
+    XCTAssertEqual(
+      MessageSortDescriptor(column: .size, ascending: false).sortOrder.first?.order,
+      .reverse
+    )
+  }
+
+  @MainActor
+  func testAppModelAscendingDescendingSortToggleState() {
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+
+    model.updateMessageSortDescriptor(.init(column: .sender, ascending: true))
+    XCTAssertEqual(model.messageSortDescriptor, .init(column: .sender, ascending: true))
+    XCTAssertEqual(model.tableSortOrder.first?.order, .forward)
+
+    model.updateMessageSortDescriptor(model.messageSortDescriptor.toggled())
+    XCTAssertEqual(model.messageSortDescriptor, .init(column: .sender, ascending: false))
+    XCTAssertEqual(model.tableSortOrder.first?.order, .reverse)
+  }
+
   func testMBOXConnectorStoresMessageOffsetsAndLengths() async throws {
     let directory = try makeTemporaryDirectory()
     let fileURL = directory.appendingPathComponent("offsets.mbox")
@@ -824,6 +869,23 @@ final class MailSurgeonTests: XCTestCase {
         with: Set(secondPage.messages.map(\.sourceIdentifier))
       )
     )
+
+    let senderAscending = try store.search(
+      sourceID: descriptor.id,
+      query: .empty,
+      sort: .init(column: .sender, ascending: true),
+      limit: 20,
+      offset: 0
+    )
+    let senderDescending = try store.search(
+      sourceID: descriptor.id,
+      query: .empty,
+      sort: .init(column: .sender, ascending: false),
+      limit: 20,
+      offset: 0
+    )
+    XCTAssertEqual(senderAscending.messages.first?.sender, "Apple <receipts@apple.example>")
+    XCTAssertEqual(senderDescending.messages.first?.sender, "Reports <reports@example.test>")
   }
 
   func testSearchQueryParserRejectsInvalidFilters() {
@@ -1347,6 +1409,35 @@ final class MailSurgeonTests: XCTestCase {
     )
   }
 
+  @MainActor
+  func testExportCommandStateValidationAndCancelledSavePanel() {
+    let panel = FakeSavePanelProvider()
+    let model = AppModel(savePanelProvider: panel)
+    model.sources = []
+    model.selectedSourceID = nil
+
+    XCTAssertFalse(model.canExportRecoveryReport)
+    XCTAssertFalse(model.canExportRecoveryMBOX)
+
+    let source = MailSourceDescriptor(
+      name: "cancel.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/cancel.mbox")
+    )
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.recoveryReport = recoveryReport(source: source)
+
+    XCTAssertTrue(model.canExportRecoveryReport)
+    XCTAssertTrue(model.canExportRecoveryMBOX)
+
+    model.exportRecoveryReportJSON()
+
+    XCTAssertEqual(panel.commands, [.recoveryReportJSON])
+    XCTAssertNil(model.recoveryErrorMessage)
+    XCTAssertFalse(model.statusMessage.contains("selhal"))
+  }
+
   private func makeTemporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("MailSurgeonTests")
@@ -1461,5 +1552,41 @@ final class MailSurgeonTests: XCTestCase {
       month: month,
       day: day
     ).date!
+  }
+
+  private func recoveryReport(source: MailSourceDescriptor) -> RecoveryReport {
+    RecoveryReport(
+      id: UUID(),
+      sourceID: source.id,
+      sourceName: source.name,
+      sourceFingerprint: SourceFingerprint(
+        fileSize: 0,
+        modificationDate: nil,
+        lightweightHash: "test"
+      ),
+      scannerVersion: "test",
+      startedAt: Date(timeIntervalSince1970: 0),
+      completedAt: Date(timeIntervalSince1970: 1),
+      totalMessagesScanned: 0,
+      totalBytesScanned: 0,
+      issues: [],
+      suggestions: [],
+      estimatedOutputMessageCount: 0,
+      estimatedRemovedDuplicateCount: 0,
+      estimatedQuarantinedMessageCount: 0,
+      estimatedOutputByteSize: 0,
+      privacyIncludesSubjectsSendersAndMessageIDs: false
+    )
+  }
+
+  @MainActor
+  private final class FakeSavePanelProvider: SavePanelProviding {
+    var commands: [SavePanelCommand] = []
+    var destinations: [SavePanelCommand: URL] = [:]
+
+    func destination(for command: SavePanelCommand) -> URL? {
+      commands.append(command)
+      return destinations[command]
+    }
   }
 }

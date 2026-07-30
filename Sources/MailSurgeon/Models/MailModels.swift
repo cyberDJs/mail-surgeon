@@ -180,6 +180,52 @@ struct MessageSortDescriptor: Equatable, Sendable {
   var ascending: Bool
 
   static let newestFirst = MessageSortDescriptor(column: .date, ascending: false)
+
+  func toggled() -> MessageSortDescriptor {
+    MessageSortDescriptor(column: column, ascending: !ascending)
+  }
+}
+
+extension MessageSortDescriptor {
+  init?(sortOrder: [KeyPathComparator<MailMessageRecord>]) {
+    guard let first = sortOrder.first else { return nil }
+    let column: MessageSortColumn
+    switch first.keyPath {
+    case \MailMessageRecord.sentDateSortKey:
+      column = .date
+    case \MailMessageRecord.sender:
+      column = .sender
+    case \MailMessageRecord.subject:
+      column = .subject
+    case \MailMessageRecord.byteSize:
+      column = .size
+    case \MailMessageRecord.attachmentSortKey:
+      column = .attachment
+    case \MailMessageRecord.categoryLabel:
+      column = .category
+    default:
+      return nil
+    }
+    self.init(column: column, ascending: first.order == .forward)
+  }
+
+  var sortOrder: [KeyPathComparator<MailMessageRecord>] {
+    let order: SortOrder = ascending ? .forward : .reverse
+    switch column {
+    case .date:
+      return [KeyPathComparator(\.sentDateSortKey, order: order)]
+    case .sender:
+      return [KeyPathComparator(\.sender, order: order)]
+    case .subject:
+      return [KeyPathComparator(\.subject, order: order)]
+    case .size:
+      return [KeyPathComparator(\.byteSize, order: order)]
+    case .attachment:
+      return [KeyPathComparator(\.attachmentSortKey, order: order)]
+    case .category:
+      return [KeyPathComparator(\.categoryLabel, order: order)]
+    }
+  }
 }
 
 struct MailboxAnalysis: Equatable, Sendable {

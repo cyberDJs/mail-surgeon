@@ -2,6 +2,16 @@ import SwiftUI
 
 struct ContentView: View {
   @EnvironmentObject private var model: AppModel
+  @State private var localMessageSearchText = ""
+  @State private var localSelectedMessageID: String?
+  @State private var localMessageSortOrder: [KeyPathComparator<MailMessageRecord>] = [
+    KeyPathComparator(\.sentDateSortKey, order: .reverse)
+  ]
+  @State private var localSelectedRecoveryIssueID: String?
+  @State private var localRecoveryIssueSortOrder: [KeyPathComparator<RecoveryIssue>] = [
+    KeyPathComparator(\.severitySortKey)
+  ]
+  @State private var searchUpdateTask: Task<Void, Never>?
 
   var body: some View {
     NavigationSplitView {
@@ -38,15 +48,16 @@ struct ContentView: View {
         model.messages = []
         model.selectedMessageID = nil
         model.selectedMessageDetail = nil
+        localSelectedMessageID = nil
+        localMessageSearchText = ""
         Task { await model.refreshIndexStatus() }
       }
-      .onChange(of: model.selectedMessageID) { _, _ in
-        Task { await model.loadSelectedMessageDetail() }
-      }
-      .onChange(of: model.messageSearchText) { _, _ in
-        Task { await model.refreshIndexedSearch(resetPage: true) }
-      }
       .task {
+        localMessageSearchText = model.messageSearchText
+        localSelectedMessageID = model.selectedMessageID
+        localMessageSortOrder = model.tableSortOrder
+        localSelectedRecoveryIssueID = model.selectedRecoveryIssueID
+        localRecoveryIssueSortOrder = model.recoveryIssueSortOrder
         await model.refreshIndexStatus()
       }
     }
@@ -241,6 +252,12 @@ struct ContentView: View {
           }
         }
 
+        if let error = model.recoveryErrorMessage {
+          Label(error, systemImage: "exclamationmark.triangle")
+            .foregroundStyle(.red)
+            .font(.callout)
+        }
+
         recoveryToolbar(report: report)
 
         HSplitView {
@@ -309,7 +326,7 @@ struct ContentView: View {
       } label: {
         Label("Export MBOX", systemImage: "square.and.arrow.up")
       }
-      .disabled(model.isRecoveryScanning)
+      .disabled(!model.canExportRecoveryMBOX)
 
       Button {
         model.exportRecoveryReportJSON()
@@ -317,6 +334,7 @@ struct ContentView: View {
         Label("JSON", systemImage: "curlybraces")
       }
       .buttonStyle(.bordered)
+      .disabled(!model.canExportRecoveryReport)
 
       Button {
         model.exportRecoveryReportMarkdown()
@@ -324,6 +342,7 @@ struct ContentView: View {
         Label("Markdown", systemImage: "doc.plaintext")
       }
       .buttonStyle(.bordered)
+      .disabled(!model.canExportRecoveryReport)
     }
     .font(.callout)
   }
@@ -339,8 +358,8 @@ struct ContentView: View {
     } else {
       Table(
         model.displayedRecoveryIssues,
-        selection: $model.selectedRecoveryIssueID,
-        sortOrder: $model.recoveryIssueSortOrder
+        selection: recoverySelectionBinding,
+        sortOrder: recoverySortBinding
       ) {
         TableColumn("Severity", value: \.severitySortKey) { issue in
           Text(issue.severity.label)
@@ -455,9 +474,12 @@ struct ContentView: View {
 
   private var browserToolbar: some View {
     HStack(spacing: 12) {
-      TextField("Hledat", text: $model.messageSearchText)
+      TextField("Hledat", text: $localMessageSearchText)
         .textFieldStyle(.roundedBorder)
         .frame(minWidth: 220)
+        .onChange(of: localMessageSearchText) { _, newValue in
+          scheduleSearchUpdate(newValue)
+        }
 
       ForEach(MessageFilter.allCases) { filter in
         Toggle(
@@ -514,8 +536,8 @@ struct ContentView: View {
       )
     } else {
       Table(
-        model.displayedMessages, selection: $model.selectedMessageID,
-        sortOrder: $model.tableSortOrder
+        model.displayedMessages, selection: messageSelectionBinding,
+        sortOrder: messageSortBinding
       ) {
         TableColumn("Date", value: \.sentDateSortKey) { record in
           Text(formatDate(record.sentDate))
@@ -649,6 +671,7 @@ struct ContentView: View {
             }
             .help("Save Attachment…")
             .buttonStyle(.bordered)
+            .disabled(!model.canSaveSelectedAttachment)
           }
           .padding(8)
           .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
@@ -668,6 +691,67 @@ struct ContentView: View {
       }
       .buttonStyle(.borderedProminent)
       .disabled(model.isWorking || model.selectedSourceID == nil)
+    }
+  }
+
+  private var messageSelectionBinding: Binding<String?> {
+    Binding(
+      get: { localSelectedMessageID },
+      set: { newValue in
+        Task { @MainActor in
+          await Task.yield()
+          localSelectedMessageID = newValue
+          model.selectMessage(id: newValue)
+        }
+      }
+    )
+  }
+
+  private var messageSortBinding: Binding<[KeyPathComparator<MailMessageRecord>]> {
+    Binding(
+      get: { localMessageSortOrder },
+      set: { newValue in
+        Task { @MainActor in
+          await Task.yield()
+          localMessageSortOrder = newValue
+          model.updateMessageSortOrder(newValue)
+        }
+      }
+    )
+  }
+
+  private var recoverySelectionBinding: Binding<String?> {
+    Binding(
+      get: { localSelectedRecoveryIssueID },
+      set: { newValue in
+        Task { @MainActor in
+          await Task.yield()
+          localSelectedRecoveryIssueID = newValue
+          model.selectRecoveryIssue(id: newValue)
+        }
+      }
+    )
+  }
+
+  private var recoverySortBinding: Binding<[KeyPathComparator<RecoveryIssue>]> {
+    Binding(
+      get: { localRecoveryIssueSortOrder },
+      set: { newValue in
+        Task { @MainActor in
+          await Task.yield()
+          localRecoveryIssueSortOrder = newValue
+          model.recoveryIssueSortOrder = newValue
+        }
+      }
+    )
+  }
+
+  private func scheduleSearchUpdate(_ value: String) {
+    searchUpdateTask?.cancel()
+    searchUpdateTask = Task { @MainActor in
+      try? await Task.sleep(for: .milliseconds(250))
+      guard !Task.isCancelled else { return }
+      model.updateMessageSearchText(value)
     }
   }
 
