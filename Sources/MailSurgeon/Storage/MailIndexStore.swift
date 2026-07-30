@@ -701,6 +701,14 @@ final class MailIndexStore: @unchecked Sendable {
 
   private func insert(_ entry: IndexedMessageEntry, sourceID: UUID) throws {
     let folderID = try folderID(sourceID: sourceID, path: entry.record.folderPath)
+
+    let containsSensitiveContent =
+      entry.record.classificationFlags.contains(.oneTimeCode)
+      || entry.record.classificationFlags.contains(.sensitive)
+
+    let storedPreviewExcerpt =
+      containsSensitiveContent ? "[REDACTED: sensitive message preview]" : entry.previewExcerpt
+
     try execute(
       """
       INSERT INTO messages (
@@ -720,7 +728,7 @@ final class MailIndexStore: @unchecked Sendable {
         .int(entry.record.hasAttachments ? 1 : 0),
         .int(Int64(entry.attachments.count)),
         .int(Int64(entry.record.classificationFlags.rawValue)),
-        .text(entry.previewExcerpt), .real(Date().timeIntervalSince1970),
+        .text(storedPreviewExcerpt), .real(Date().timeIntervalSince1970),
       ])
     let messagePK = sqlite3_last_insert_rowid(db)
     for recipient in entry.record.recipients {
@@ -754,7 +762,7 @@ final class MailIndexStore: @unchecked Sendable {
       [
         .text(sourceID.uuidString), .int(messagePK), .text(entry.record.subject),
         .text(entry.record.sender), .text(entry.record.recipients.joined(separator: " ")),
-        .text(entry.previewExcerpt),
+        .text(storedPreviewExcerpt),
       ])
   }
 
