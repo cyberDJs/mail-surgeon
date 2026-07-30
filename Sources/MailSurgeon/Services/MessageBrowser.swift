@@ -3,6 +3,7 @@ import Foundation
 struct MessageBrowser: Sendable {
     private let factory = ConnectorFactory()
     private let parser = MailMessageParser()
+    private let mimeParser = MIMEParser()
 
     func loadSummaries(
         source: MailSourceDescriptor,
@@ -17,11 +18,12 @@ struct MessageBrowser: Sendable {
         for try await record in connector.scanMessages() {
             records.append(record)
             bytesScanned += record.byteSize
-            await progress?(AnalysisProgress(
-                messagesScanned: records.count,
-                bytesScanned: bytesScanned,
-                status: "Načítám přehled: \(record.folderPath)"
-            ))
+            await progress?(
+                AnalysisProgress(
+                    messagesScanned: records.count,
+                    bytesScanned: bytesScanned,
+                    status: "Načítám přehled: \(record.folderPath)"
+                ))
         }
 
         return markDuplicates(in: records)
@@ -48,6 +50,32 @@ struct MessageBrowser: Sendable {
         }.value
     }
 
+    func loadAttachmentData(id: String, for record: MailMessageRecord) async throws -> Data {
+        guard let location = record.location else {
+            throw ConnectorError.accessDenied("Zpráva nemá uložené umístění pro on-demand čtení.")
+        }
+
+        return try await Task.detached {
+            try Task.checkCancellation()
+            let scoped = location.fileURL.startAccessingSecurityScopedResource()
+            defer {
+                if scoped { location.fileURL.stopAccessingSecurityScopedResource() }
+            }
+
+            let handle = try FileHandle(forReadingFrom: location.fileURL)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: location.byteOffset)
+            guard let data = try handle.read(upToCount: Int(location.byteLength)) else {
+                throw ConnectorError.unreadableFile(location.fileURL.lastPathComponent)
+            }
+
+            guard let attachmentData = mimeParser.decodedAttachmentData(id: id, from: data) else {
+                throw ConnectorError.malformedArchive("Příloha už není v aktuální zprávě dostupná.")
+            }
+            return attachmentData
+        }.value
+    }
+
     func filter(
         records: [MailMessageRecord],
         searchText: String,
@@ -59,9 +87,12 @@ struct MessageBrowser: Sendable {
             if trimmedSearch.isEmpty {
                 matchesSearch = true
             } else {
-                matchesSearch = record.subject.localizedCaseInsensitiveContains(trimmedSearch)
+                matchesSearch =
+                    record.subject.localizedCaseInsensitiveContains(trimmedSearch)
                     || record.sender.localizedCaseInsensitiveContains(trimmedSearch)
-                    || record.recipients.contains { $0.localizedCaseInsensitiveContains(trimmedSearch) }
+                    || record.recipients.contains {
+                        $0.localizedCaseInsensitiveContains(trimmedSearch)
+                    }
             }
 
             guard matchesSearch else { return false }

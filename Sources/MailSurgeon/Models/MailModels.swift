@@ -124,8 +124,26 @@ struct MessageDetail: Equatable, Sendable {
     let headers: [String: String]
     let metadata: [String: String]
     let plainTextPreview: String?
+    let attachments: [MessageAttachmentMetadata]
+    let mimeWarnings: [String]
     let rawByteSize: Int64
     let rawSHA256: String
+}
+
+struct MessageAttachmentMetadata: Identifiable, Equatable, Sendable {
+    let id: String
+    let filename: String?
+    let mimeType: String
+    let byteSize: Int64
+    let contentID: String?
+    let disposition: String?
+    let transferEncoding: String
+    let lazyReference: String?
+
+    var displayName: String {
+        guard let filename, !filename.isEmpty else { return "(bez názvu)" }
+        return filename
+    }
 }
 
 enum MessageFilter: String, CaseIterable, Identifiable, Sendable {

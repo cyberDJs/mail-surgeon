@@ -51,7 +51,10 @@ struct ContentView: View {
             }
             HStack(spacing: 18) {
                 Label("\(model.progress.messagesScanned) zpráv", systemImage: "envelope.open")
-                Label(ByteCountFormatter.string(fromByteCount: model.progress.bytesScanned, countStyle: .file), systemImage: "doc.text.magnifyingglass")
+                Label(
+                    ByteCountFormatter.string(
+                        fromByteCount: model.progress.bytesScanned, countStyle: .file),
+                    systemImage: "doc.text.magnifyingglass")
                 Text(model.progress.status)
                     .foregroundStyle(.secondary)
             }
@@ -72,13 +75,19 @@ struct ContentView: View {
         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 18) {
             GridRow {
                 metric("Zprávy", value: "\(model.analysis.totalMessages)", icon: "envelope")
-                metric("Velikost", value: ByteCountFormatter.string(fromByteCount: model.analysis.totalBytes, countStyle: .file), icon: "externaldrive")
+                metric(
+                    "Velikost",
+                    value: ByteCountFormatter.string(
+                        fromByteCount: model.analysis.totalBytes, countStyle: .file),
+                    icon: "externaldrive")
                 metric("Duplicity", value: "\(model.analysis.exactDuplicates)", icon: "doc.on.doc")
             }
             GridRow {
-                metric("Newslettery", value: "\(model.analysis.likelyNewsletters)", icon: "megaphone")
+                metric(
+                    "Newslettery", value: "\(model.analysis.likelyNewsletters)", icon: "megaphone")
                 metric("OTP", value: "\(model.analysis.likelyOneTimeCodes)", icon: "number.square")
-                metric("Citlivé", value: "\(model.analysis.sensitiveCandidates)", icon: "lock.shield")
+                metric(
+                    "Citlivé", value: "\(model.analysis.sensitiveCandidates)", icon: "lock.shield")
             }
             GridRow {
                 metric("Velké zprávy", value: "\(model.analysis.largeMessages)", icon: "tray.full")
@@ -109,10 +118,13 @@ struct ContentView: View {
                 .frame(minWidth: 220)
 
             ForEach(MessageFilter.allCases) { filter in
-                Toggle(filter.rawValue, isOn: Binding(
-                    get: { model.enabledMessageFilters.contains(filter) },
-                    set: { model.setFilter(filter, enabled: $0) }
-                ))
+                Toggle(
+                    filter.rawValue,
+                    isOn: Binding(
+                        get: { model.enabledMessageFilters.contains(filter) },
+                        set: { model.setFilter(filter, enabled: $0) }
+                    )
+                )
                 .toggleStyle(.checkbox)
             }
 
@@ -156,7 +168,10 @@ struct ContentView: View {
                 description: Text("Změň hledání nebo filtr.")
             )
         } else {
-            Table(model.displayedMessages, selection: $model.selectedMessageID, sortOrder: $model.tableSortOrder) {
+            Table(
+                model.displayedMessages, selection: $model.selectedMessageID,
+                sortOrder: $model.tableSortOrder
+            ) {
                 TableColumn("Date", value: \.sentDateSortKey) { record in
                     Text(formatDate(record.sentDate))
                 }
@@ -175,8 +190,10 @@ struct ContentView: View {
                 .width(min: 240, ideal: 360)
 
                 TableColumn("Size", value: \.byteSize) { record in
-                    Text(ByteCountFormatter.string(fromByteCount: record.byteSize, countStyle: .file))
-                        .monospacedDigit()
+                    Text(
+                        ByteCountFormatter.string(fromByteCount: record.byteSize, countStyle: .file)
+                    )
+                    .monospacedDigit()
                 }
                 .width(min: 90, ideal: 110)
 
@@ -223,10 +240,25 @@ struct ContentView: View {
                             }
                         }
 
-                        detailSection("Raw", rows: [
-                            "Size": ByteCountFormatter.string(fromByteCount: detail.rawByteSize, countStyle: .file),
-                            "SHA-256": detail.rawSHA256
-                        ])
+                        attachmentSection(detail.attachments)
+
+                        if !detail.mimeWarnings.isEmpty {
+                            detailSection(
+                                "MIME upozornění",
+                                rows: Dictionary(
+                                    uniqueKeysWithValues: detail.mimeWarnings.enumerated().map {
+                                        ("Upozornění \($0.offset + 1)", $0.element)
+                                    }
+                                ))
+                        }
+
+                        detailSection(
+                            "Raw",
+                            rows: [
+                                "Size": ByteCountFormatter.string(
+                                    fromByteCount: detail.rawByteSize, countStyle: .file),
+                                "SHA-256": detail.rawSHA256,
+                            ])
                         detailSection("Headers", rows: detail.headers)
                     }
                     .textSelection(.enabled)
@@ -239,6 +271,45 @@ struct ContentView: View {
                     description: Text("Detail se načítá až po výběru řádku.")
                 )
             }
+        }
+    }
+
+    @ViewBuilder
+    private func attachmentSection(_ attachments: [MessageAttachmentMetadata]) -> some View {
+        if !attachments.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Přílohy")
+                    .font(.subheadline.bold())
+                ForEach(attachments) { attachment in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Image(systemName: "paperclip")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(attachment.displayName)
+                                .font(.callout.weight(.medium))
+                                .lineLimit(1)
+                            Text(
+                                "\(attachment.mimeType) • \(ByteCountFormatter.string(fromByteCount: attachment.byteSize, countStyle: .file))"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        }
+                        Spacer()
+                        Button {
+                            Task { await model.saveAttachment(attachment) }
+                        } label: {
+                            Label("Uložit přílohu", systemImage: "square.and.arrow.down")
+                                .labelStyle(.iconOnly)
+                        }
+                        .help("Save Attachment…")
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .textSelection(.disabled)
         }
     }
 
