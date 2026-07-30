@@ -249,6 +249,123 @@ final class MailSurgeonTests: XCTestCase {
     XCTAssertEqual(model.tableSortOrder.first?.order, .reverse)
   }
 
+  @MainActor
+  func testSelectingNewSourceClearsStaleMessageAndRecoveryState() async {
+    let first = MailSourceDescriptor(
+      name: "first.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/first.mbox")
+    )
+    let second = MailSourceDescriptor(
+      name: "second.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/second.mbox")
+    )
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.sources = [first, second]
+    model.selectedSourceID = first.id
+    model.messages = [record(subject: "Old", sender: "old@example.test")]
+    model.selectedMessageID = model.messages.first?.id
+    model.messageSearchText = "old"
+    model.enabledMessageFilters = [.duplicates, .large]
+    model.recoveryReport = recoveryReport(source: first)
+    model.selectedRecoveryIssueID = "stale"
+    model.messagePageOffset = 200
+
+    await model.selectSource(id: second.id)
+
+    XCTAssertEqual(model.selectedSourceID, second.id)
+    XCTAssertTrue(model.messages.isEmpty)
+    XCTAssertNil(model.selectedMessageID)
+    XCTAssertNil(model.selectedMessageDetail)
+    XCTAssertEqual(model.messageSearchText, "")
+    XCTAssertTrue(model.enabledMessageFilters.isEmpty)
+    XCTAssertNil(model.recoveryReport)
+    XCTAssertNil(model.selectedRecoveryIssueID)
+    XCTAssertEqual(model.messagePageOffset, 0)
+  }
+
+  @MainActor
+  func testSelectingNoSourceProducesSafeEmptyState() async {
+    let source = MailSourceDescriptor(
+      name: "source.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/source.mbox")
+    )
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.messages = [record(subject: "Old", sender: "old@example.test")]
+
+    await model.selectSource(id: nil)
+
+    XCTAssertNil(model.selectedSourceID)
+    XCTAssertTrue(model.messages.isEmpty)
+    XCTAssertNil(model.selectedMessageID)
+    XCTAssertNil(model.selectedMessageDetail)
+    XCTAssertEqual(model.indexProgress.status, .notIndexed)
+  }
+
+  @MainActor
+  func testSearchUpdateResetsIndexedPaging() async {
+    let source = MailSourceDescriptor(
+      name: "indexed.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/indexed.mbox")
+    )
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.indexProgress = MailIndexProgress(
+      status: .indexed,
+      indexedMessages: 400,
+      bytesIndexed: 0,
+      databaseSize: 0,
+      detail: "Indexováno"
+    )
+    model.messagePageOffset = 200
+
+    await model.applyMessageSearchText("subject:invoice")
+
+    XCTAssertEqual(model.messageSearchText, "subject:invoice")
+    XCTAssertEqual(model.messagePageOffset, 0)
+  }
+
+  @MainActor
+  func testSortUpdateResetsIndexedPaging() async {
+    let source = MailSourceDescriptor(
+      name: "indexed.mbox",
+      kind: .mbox,
+      location: URL(fileURLWithPath: "/tmp/indexed.mbox")
+    )
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.sources = [source]
+    model.selectedSourceID = source.id
+    model.indexProgress = MailIndexProgress(
+      status: .indexed,
+      indexedMessages: 400,
+      bytesIndexed: 0,
+      databaseSize: 0,
+      detail: "Indexováno"
+    )
+    model.messagePageOffset = 200
+
+    await model.applyMessageSortDescriptor(.init(column: .sender, ascending: true))
+
+    XCTAssertEqual(model.messageSortDescriptor, .init(column: .sender, ascending: true))
+    XCTAssertEqual(model.messagePageOffset, 0)
+  }
+
+  @MainActor
+  func testFilterResetClearsAllMessageFilters() async {
+    let model = AppModel(savePanelProvider: FakeSavePanelProvider())
+    model.enabledMessageFilters = [.duplicates, .large, .sensitive]
+
+    await model.resetMessageFilters()
+
+    XCTAssertTrue(model.enabledMessageFilters.isEmpty)
+  }
+
   func testMBOXConnectorStoresMessageOffsetsAndLengths() async throws {
     let directory = try makeTemporaryDirectory()
     let fileURL = directory.appendingPathComponent("offsets.mbox")
