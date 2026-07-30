@@ -18,6 +18,7 @@ final class AppModel: ObservableObject {
   @Published var tableSortOrder: [KeyPathComparator<MailMessageRecord>] = [
     KeyPathComparator(\.sentDateSortKey, order: .reverse)
   ]
+  @Published private(set) var messageSortDescriptor: MessageSortDescriptor = .newestFirst
   @Published var browserErrorMessage: String?
   @Published var isLoadingMessages = false
   @Published var isLoadingDetail = false
@@ -45,6 +46,7 @@ final class AppModel: ObservableObject {
   private let indexer = MailIndexingService()
   private let recoveryScanner = RecoveryScanner()
   private let recoveryExporter = RecoveryExportService()
+  private let savePanelProvider: any SavePanelProviding
   private let searchQueryParser = SearchQueryParser()
   private var indexStore: MailIndexStore?
   private let messagePageLimit = 200
@@ -66,8 +68,7 @@ final class AppModel: ObservableObject {
       enabledFilters: enabledMessageFilters
     )
 
-    guard !tableSortOrder.isEmpty else { return filtered }
-    return filtered.sorted(using: tableSortOrder)
+    return browser.sort(records: filtered, descriptor: messageSortDescriptor)
   }
 
   var selectedMessage: MailMessageRecord? {
@@ -113,7 +114,20 @@ final class AppModel: ObservableObject {
     return recoveryReport?.suggestions.first { $0.issueID == selectedRecoveryIssue.id }
   }
 
-  init() {
+  var canExportRecoveryReport: Bool {
+    recoveryReport != nil && !isRecoveryScanning
+  }
+
+  var canExportRecoveryMBOX: Bool {
+    selectedSource != nil && recoveryReport != nil && !isRecoveryScanning
+  }
+
+  var canSaveSelectedAttachment: Bool {
+    selectedMessage != nil && selectedMessageDetail != nil
+  }
+
+  init(savePanelProvider: any SavePanelProviding = AppKitSavePanelProvider()) {
+    self.savePanelProvider = savePanelProvider
     indexStore = try? MailIndexStore(databaseURL: MailIndexStore.defaultDatabaseURL())
     restoreBookmarkedSources()
   }
@@ -323,6 +337,7 @@ final class AppModel: ObservableObject {
       let page = try store.search(
         sourceID: source.id,
         query: query,
+        sort: messageSortDescriptor,
         limit: messagePageLimit,
         offset: messagePageOffset
       )
@@ -371,22 +386,61 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func selectMessage(id: String?) {
+    guard selectedMessageID != id else { return }
+    selectedMessageID = id
+    Task { @MainActor [weak self] in
+      await Task.yield()
+      await self?.loadSelectedMessageDetail()
+    }
+  }
+
+  func selectRecoveryIssue(id: String?) {
+    guard selectedRecoveryIssueID != id else { return }
+    selectedRecoveryIssueID = id
+  }
+
+  func updateMessageSearchText(_ text: String) {
+    guard messageSearchText != text else { return }
+    messageSearchText = text
+    if canUseIndex {
+      Task { @MainActor [weak self] in
+        await self?.refreshIndexedSearch(resetPage: true)
+      }
+    }
+  }
+
+  func updateMessageSortOrder(_ sortOrder: [KeyPathComparator<MailMessageRecord>]) {
+    guard let descriptor = MessageSortDescriptor(sortOrder: sortOrder) else { return }
+    updateMessageSortDescriptor(descriptor)
+  }
+
+  func updateMessageSortDescriptor(_ descriptor: MessageSortDescriptor) {
+    guard messageSortDescriptor != descriptor else { return }
+    messageSortDescriptor = descriptor
+    tableSortOrder = descriptor.sortOrder
+    if canUseIndex {
+      Task { @MainActor [weak self] in
+        await self?.refreshIndexedSearch(resetPage: true)
+      }
+    }
+  }
+
   func saveAttachment(_ attachment: MessageAttachmentMetadata) async {
     guard let record = selectedMessage else {
       statusMessage = "Nejdřív vyber zprávu."
       return
     }
 
-    let panel = NSSavePanel()
-    panel.title = "Uložit přílohu"
-    panel.message = "Vyber cílový soubor. Zdrojový mailbox zůstane beze změny."
-    panel.prompt = "Uložit"
-    panel.nameFieldStringValue =
+    let defaultName =
       attachment.displayName == "(bez názvu)"
       ? "attachment"
       : attachment.displayName
 
-    guard panel.runModal() == .OK, let destination = panel.url else {
+    guard
+      let destination = savePanelProvider.destination(
+        for: .attachment(defaultName: defaultName))
+    else {
       statusMessage = "Uložení přílohy bylo zrušeno."
       return
     }
@@ -505,12 +559,8 @@ final class AppModel: ObservableObject {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
-    let panel = NSSavePanel()
-    panel.title = "Export Recovery JSON"
-    panel.message = "Report neobsahuje kompletní těla zpráv."
-    panel.prompt = "Exportovat"
-    panel.nameFieldStringValue = "recovery-report.json"
-    guard panel.runModal() == .OK, let url = panel.url else { return }
+    recoveryErrorMessage = nil
+    guard let url = savePanelProvider.destination(for: .recoveryReportJSON) else { return }
     do {
       try recoveryReport.jsonData().write(to: url, options: .atomic)
       statusMessage = "Recovery JSON report uložen."
@@ -525,12 +575,8 @@ final class AppModel: ObservableObject {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
-    let panel = NSSavePanel()
-    panel.title = "Export Recovery Markdown"
-    panel.message = "Report neobsahuje kompletní těla zpráv."
-    panel.prompt = "Exportovat"
-    panel.nameFieldStringValue = "recovery-report.md"
-    guard panel.runModal() == .OK, let url = panel.url else { return }
+    recoveryErrorMessage = nil
+    guard let url = savePanelProvider.destination(for: .recoveryReportMarkdown) else { return }
     do {
       try recoveryReport.markdown().write(to: url, atomically: true, encoding: .utf8)
       statusMessage = "Recovery Markdown report uložen."
@@ -545,12 +591,11 @@ final class AppModel: ObservableObject {
       statusMessage = "Nejdřív spusť recovery dry run."
       return
     }
-    let panel = NSSavePanel()
-    panel.title = "Export Recovery MBOX"
-    panel.message = "Vyber nový cílový MBOX. Zdroj nebude přepsán."
-    panel.prompt = "Exportovat"
-    panel.nameFieldStringValue = "\(source.name)-recovered.mbox"
-    guard panel.runModal() == .OK, let destination = panel.url else { return }
+    recoveryErrorMessage = nil
+    guard
+      let destination = savePanelProvider.destination(
+        for: .recoveryMBOX(defaultName: "\(source.name)-recovered.mbox"))
+    else { return }
 
     isRecoveryScanning = true
     defer { isRecoveryScanning = false }
