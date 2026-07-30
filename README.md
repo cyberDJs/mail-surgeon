@@ -4,7 +4,9 @@ macOS aplikace pro bezpečnou analýzu, čištění, zálohu a migraci e-mailů.
 
 ## Stav
 
-Toto je **Phase 0 scaffold**: běžící SwiftUI kostra, datový model, konektorové rozhraní, analyzátor a Keychain wrapper. Konektory jsou zatím placeholdery a nic nemažou ani neupravují.
+Mail Surgeon má nativní macOS workspace se třemi oddělenými oblastmi:
+Zprávy, Recovery a Export. Výchozí režim je privacy-first a read-only; zdrojové
+mailboxy se při prohlížení, indexaci, dry runu ani exportu neupravují.
 
 ## Plán MVP
 
@@ -43,6 +45,8 @@ make run
 is the supported GUI launch method. It launches the generated bundle at
 `.build/app/MailSurgeon.app`, which is a local build artifact and is not
 committed to Git.
+
+Manual UI QA checklist is in `Docs/MANUAL_UI_QA.md`.
 
 ## Bezpečnostní zásady
 

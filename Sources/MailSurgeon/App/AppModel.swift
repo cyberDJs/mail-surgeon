@@ -49,7 +49,7 @@ final class AppModel: ObservableObject {
   private let savePanelProvider: any SavePanelProviding
   private let searchQueryParser = SearchQueryParser()
   private var indexStore: MailIndexStore?
-  private let messagePageLimit = 200
+  let messagePageLimit = 200
   private var recoveryTask: Task<Void, Never>?
 
   var selectedSource: MailSourceDescriptor? {
@@ -238,6 +238,33 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func selectSource(id: UUID?) async {
+    guard selectedSourceID != id else {
+      await refreshIndexStatus()
+      return
+    }
+
+    selectedSourceID = id
+    analysis = .empty
+    progress = .idle
+    recoveryProgress = .idle
+    recoveryReport = nil
+    recoveryErrorMessage = nil
+    selectedRecoveryIssueID = nil
+    enabledRecoverySeverities = []
+    selectedRecoveryIssueKind = nil
+    resetBrowserState(keepMessages: false)
+
+    guard let selectedSource else {
+      indexProgress = .notIndexed
+      statusMessage = sources.isEmpty ? "Není nakonfigurovaný žádný zdroj." : "Vyber zdroj."
+      return
+    }
+
+    statusMessage = "Vybrán zdroj: \(selectedSource.name)"
+    await refreshIndexStatus()
+  }
+
   func refreshIndexStatus() async {
     guard let source = selectedSource, let store = indexStore else {
       indexProgress = .notIndexed
@@ -386,13 +413,10 @@ final class AppModel: ObservableObject {
     }
   }
 
-  func selectMessage(id: String?) {
+  func selectMessage(id: String?) async {
     guard selectedMessageID != id else { return }
     selectedMessageID = id
-    Task { @MainActor [weak self] in
-      await Task.yield()
-      await self?.loadSelectedMessageDetail()
-    }
+    await loadSelectedMessageDetail()
   }
 
   func selectRecoveryIssue(id: String?) {
@@ -410,6 +434,14 @@ final class AppModel: ObservableObject {
     }
   }
 
+  func applyMessageSearchText(_ text: String) async {
+    guard messageSearchText != text else { return }
+    messageSearchText = text
+    if canUseIndex {
+      await refreshIndexedSearch(resetPage: true)
+    }
+  }
+
   func updateMessageSortOrder(_ sortOrder: [KeyPathComparator<MailMessageRecord>]) {
     guard let descriptor = MessageSortDescriptor(sortOrder: sortOrder) else { return }
     updateMessageSortDescriptor(descriptor)
@@ -423,6 +455,15 @@ final class AppModel: ObservableObject {
       Task { @MainActor [weak self] in
         await self?.refreshIndexedSearch(resetPage: true)
       }
+    }
+  }
+
+  func applyMessageSortDescriptor(_ descriptor: MessageSortDescriptor) async {
+    guard messageSortDescriptor != descriptor else { return }
+    messageSortDescriptor = descriptor
+    tableSortOrder = descriptor.sortOrder
+    if canUseIndex {
+      await refreshIndexedSearch(resetPage: true)
     }
   }
 
@@ -464,6 +505,38 @@ final class AppModel: ObservableObject {
     if canUseIndex {
       Task { await refreshIndexedSearch(resetPage: true) }
     }
+  }
+
+  func applyFilter(_ filter: MessageFilter, enabled: Bool) async {
+    if enabled {
+      enabledMessageFilters.insert(filter)
+    } else {
+      enabledMessageFilters.remove(filter)
+    }
+    if canUseIndex {
+      await refreshIndexedSearch(resetPage: true)
+    }
+  }
+
+  func resetMessageFilters() async {
+    guard !enabledMessageFilters.isEmpty else { return }
+    enabledMessageFilters = []
+    if canUseIndex {
+      await refreshIndexedSearch(resetPage: true)
+    }
+  }
+
+  func setRecoverySeverity(_ severity: RecoverySeverity, enabled: Bool) {
+    if enabled {
+      enabledRecoverySeverities.insert(severity)
+    } else {
+      enabledRecoverySeverities.remove(severity)
+    }
+  }
+
+  func resetRecoveryFilters() {
+    enabledRecoverySeverities = []
+    selectedRecoveryIssueKind = nil
   }
 
   func runDryAnalysis() async {
